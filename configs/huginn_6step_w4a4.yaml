@@ -9,5 +9,4 @@ method:
   cldc: {enabled: true, implementation: learned_rotation_group_aware_v2, learnable_rotation: true, rotation_block_size: 32, reordering: group_aware, reorder_max_passes: 3, optimization_steps: 80, learning_rate: 1.0e-2, robust_temperature: 0.1, lambda_sync: 0.1, lambda_reg: 1.0e-4}
   ilpa: {enabled: true, selection_samples: 32, interaction_shrinkage: 0.5}
   lctc: {enabled: true}
-evaluation: {wikitext2: true, c4: true, zero_shot: true, batch_size: 16, ppl_batch_size: 16, sequence_length: 2048, limit: null, full_eval: true}
 output_dir: outputs/huginn_6step_w4a4

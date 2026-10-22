@@ -527,6 +527,10 @@ def apply_lctc_calibration(model: nn.Module, cgb: LoopConditionedCGB) -> _LCTCRu
     model._loopquant_lctc_runtime = runtime
     original_forward = model.forward
 
+    # Preserve the HF forward signature for generate()'s model-kwargs validation.
+    from functools import wraps
+
+    @wraps(original_forward)
     def wrapped(*args: Any, **kwargs: Any):
         token = ACTIVE_LCTC_RUNTIME.set(model._loopquant_lctc_runtime)
         try:

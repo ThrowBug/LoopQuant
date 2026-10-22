@@ -1,0 +1,2 @@
+# Launchers are executed on Linux even when edited from Windows.
+*.sh text eol=lf

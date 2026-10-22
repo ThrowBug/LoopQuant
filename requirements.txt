@@ -7,4 +7,5 @@ sentencepiece
 numpy
 pyyaml
 tqdm
-lm-eval
+lm-eval==0.4.13
+evaluate==0.4.6

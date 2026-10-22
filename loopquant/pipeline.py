@@ -134,11 +134,17 @@ class LoopQuantPipeline:
                 model_family=self.config.model_family,
                 device=self.device,
                 num_loops=int(self.config.num_loops),
+                configure_context=False,
             )
+        QUANTIZATION_CONTEXT.configure(int(self.config.num_loops), allocation)
+        QUANTIZATION_CONTEXT.enabled = True
         lctc_summary = self.run_lctc(
             model, teacher_model, calibration_data, allocation
         )
         self.logger.info("[LoopQuant] Completed CLDC -> ILPA -> LCTC")
+        if tuple(allocation) != QUANTIZATION_CONTEXT.activation_bits:
+            raise RuntimeError("student activation allocation changed during calibration")
+        model._loopquant_allocation = tuple(allocation)
         return LoopQuantResult(model, allocation, cldc_summary, ilpa_summary, lctc_summary)
 
 

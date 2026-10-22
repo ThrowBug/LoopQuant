@@ -1,0 +1,24 @@
+# Shared protocol for BF16 and any quantization/module-replacement experiment.
+# Explicit starting budgets, not a claim to reproduce any published model score.
+evaluation:
+  batch_size: 16
+  sequence_length: 2048
+  seed: 0
+  limit: null
+  generative:
+    batch_size: 8
+    max_length: 4096
+    use_cache: true
+    allow_truncation: true
+    apply_chat_template: false
+    fewshot_seed: 0
+    save_samples: true
+    # Set true only in the configured Linux code-execution environment.
+    # Also requires HF_ALLOW_CODE_EVAL=1. Neither setting provides isolation.
+    confirm_run_unsafe_code: true
+    tasks:
+      - {name: gsm8k_cot, num_fewshot: 8, max_gen_toks: 1024}
+      - {name: triviaqa, num_fewshot: 5, max_gen_toks: 64}
+      - {name: bbh_cot_fewshot, num_fewshot: null, max_gen_toks: 1024}
+      - {name: drop, num_fewshot: 1, max_gen_toks: 128}
+      - {name: mbpp, num_fewshot: 3, max_gen_toks: 1024}

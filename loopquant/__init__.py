@@ -6,8 +6,15 @@ from .hub_compat import patch_hub_pagination
 patch_hub_pagination()
 
 from .config import LoopQuantConfig
-from .pipeline import LoopQuantPipeline, quantize_looped_transformer
 
 __version__ = "1.0.0"
 
 __all__ = ["LoopQuantConfig", "LoopQuantPipeline", "quantize_looped_transformer"]
+
+
+def __getattr__(name):
+    # Evaluation-only imports need not import the quantization pipeline.
+    if name in {"LoopQuantPipeline", "quantize_looped_transformer"}:
+        from . import pipeline
+        return getattr(pipeline, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

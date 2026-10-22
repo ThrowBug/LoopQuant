@@ -9,13 +9,11 @@ from typing import Any
 
 import yaml
 
-
 DEFAULTS: dict[str, Any] = {
     "model_family": "ouro",
     "model_variant": None,
     "model_key": None,
     "model_path": None,
-    "num_loops": 4,
     "quantization": {
         "weight_bits": 4,
         "group_size": 32,
@@ -46,6 +44,8 @@ DEFAULTS: dict[str, Any] = {
             "robust_temperature": 0.1,
             "lambda_sync": 0.1,
             "lambda_reg": 1.0e-4,
+            "rotation_seed": 42,
+            "statistics_sequences": 16,
         },
         "ilpa": {"enabled": True, "selection_samples": 32, "interaction_shrinkage": 0.5},
         "lctc": {
@@ -55,16 +55,6 @@ DEFAULTS: dict[str, Any] = {
             "task_objective_weight": 0.03,
         },
     },
-    "evaluation": {
-        "wikitext2": True,
-        "c4": True,
-        "zero_shot": True,
-        "batch_size": 16,
-        "ppl_batch_size": 16,
-        "sequence_length": 2048,
-        "limit": None,
-        "full_eval": True,
-    },
     "output_dir": "outputs/loopquant",
 }
 
@@ -72,6 +62,8 @@ DEFAULTS: dict[str, Any] = {
 def _merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
     result = deepcopy(base)
     for key, value in updates.items():
+        if key not in base:
+            raise ValueError(f"unknown configuration parameter: {key}")
         if isinstance(value, dict) and isinstance(result.get(key), dict):
             result[key] = _merge(result[key], value)
         else:
@@ -83,21 +75,22 @@ def _merge(base: dict[str, Any], updates: dict[str, Any]) -> dict[str, Any]:
 class LoopQuantConfig:
     """Compact configuration with dict sections matching the public YAML files."""
 
+    num_loops: int
     model_family: str = "ouro"
     model_variant: str | None = None
     model_key: str | None = None
     model_path: str | None = None
-    num_loops: int = 4
     quantization: dict[str, Any] = field(default_factory=lambda: deepcopy(DEFAULTS["quantization"]))
     calibration: dict[str, Any] = field(default_factory=lambda: deepcopy(DEFAULTS["calibration"]))
     method: dict[str, Any] = field(default_factory=lambda: deepcopy(DEFAULTS["method"]))
-    evaluation: dict[str, Any] = field(default_factory=lambda: deepcopy(DEFAULTS["evaluation"]))
     output_dir: str = "outputs/loopquant"
 
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> "LoopQuantConfig":
-        merged = _merge(DEFAULTS, values)
-        config = cls(**merged)
+        if "num_loops" not in values:
+            raise ValueError("num_loops is required in the quantization configuration")
+        merged = _merge(DEFAULTS, {key: value for key, value in values.items() if key != "num_loops"})
+        config = cls(num_loops=values["num_loops"], **merged)
         config.validate()
         return config
 
@@ -118,11 +111,12 @@ class LoopQuantConfig:
             "quantization": deepcopy(self.quantization),
             "calibration": deepcopy(self.calibration),
             "method": deepcopy(self.method),
-            "evaluation": deepcopy(self.evaluation),
             "output_dir": self.output_dir,
         }
 
     def validate(self) -> None:
+        if isinstance(self.num_loops, bool) or not isinstance(self.num_loops, int) or self.num_loops <= 0:
+            raise ValueError("num_loops must be a positive integer")
         if self.model_family.lower() not in {"ouro", "nanbeige", "huginn"}:
             raise ValueError("model_family must be ouro, nanbeige, or huginn")
         expected_loops = {"ouro": 4, "nanbeige": 2, "huginn": 6}[self.model_family.lower()]
@@ -130,8 +124,6 @@ class LoopQuantConfig:
             raise ValueError(
                 f"{self.model_family} formal runs require num_loops={expected_loops}"
             )
-        if int(self.num_loops) <= 0:
-            raise ValueError("num_loops must be positive")
         q = self.quantization
         if int(q["weight_bits"]) != 4 or int(q["group_size"]) != 32:
             raise ValueError("the validated public path is W4 with group size 32")
@@ -157,11 +149,6 @@ class LoopQuantConfig:
             raise ValueError("the validated calibration dataset is WikiText-2")
         if int(calibration["num_samples"]) <= 0 or int(calibration["sequence_length"]) <= 1:
             raise ValueError("calibration sample count and sequence length must be positive")
-        evaluation = self.evaluation
-        if evaluation.get("limit") is not None and evaluation.get("full_eval", False):
-            raise ValueError("full_eval=true requires evaluation.limit=null")
-        if int(evaluation.get("ppl_batch_size", 1)) <= 0:
-            raise ValueError("evaluation.ppl_batch_size must be positive")
 
     def apply_overrides(self, **values: Any) -> None:
         for key, value in values.items():
