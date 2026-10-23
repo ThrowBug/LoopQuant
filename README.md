@@ -38,6 +38,8 @@ evaluation suites. Edit their flag lists to select a different combination.
 `eval.sh` defaults to `USE_VLLM=1`, so it skips PPL. Set `USE_VLLM=0` to use HF
 and run all selected suites, including PPL. Direct CLI calls still require an
 explicit `--vllm` flag to select vLLM.
+Both launchers default to `TOKENIZERS_PARALLELISM=false` and
+`HF_ALLOW_CODE_EVAL=1`; existing environment values override these defaults.
 
 ```bash
 # Quantize -> save -> PPL/zero-shot. Reads model_path/output_dir from the run YAML.
@@ -46,25 +48,25 @@ conda activate loopquant && \
 
 # vLLM: original HF model (replace the ID with a local HF directory if needed).
 conda activate loopquant-vllm && \
-  USE_VLLM=1 HF_ALLOW_CODE_EVAL=1 CUDA_VISIBLE_DEVICES=0 \
+  USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
   LOOPQUANT_EVAL_OUTPUT_DIR=outputs/ouro_1.4b_bf16_vllm_eval \
   bash scripts/eval.sh ByteDance/Ouro-1.4B 4
 
 # vLLM: saved fake-quantized model.
 conda activate loopquant-vllm && \
-  USE_VLLM=1 HF_ALLOW_CODE_EVAL=1 CUDA_VISIBLE_DEVICES=0 \
+  USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
   LOOPQUANT_EVAL_OUTPUT_DIR=outputs/ouro_1.4b_w4a4_vllm_eval \
   bash scripts/eval.sh outputs/ouro_1.4b_w4a4/loopquant 4
 
 # HF (without vLLM): original HF model, including PPL evaluation.
 conda activate loopquant && \
-  USE_VLLM=0 HF_ALLOW_CODE_EVAL=1 CUDA_VISIBLE_DEVICES=0 \
+  USE_VLLM=0 CUDA_VISIBLE_DEVICES=0 \
   LOOPQUANT_EVAL_OUTPUT_DIR=outputs/ouro_1.4b_bf16_hf_eval \
   bash scripts/eval.sh ByteDance/Ouro-1.4B 4
 
 # HF (without vLLM): saved fake-quantized model, including PPL evaluation.
 conda activate loopquant && \
-  USE_VLLM=0 HF_ALLOW_CODE_EVAL=1 CUDA_VISIBLE_DEVICES=0 \
+  USE_VLLM=0 CUDA_VISIBLE_DEVICES=0 \
   LOOPQUANT_EVAL_OUTPUT_DIR=outputs/ouro_1.4b_w4a4_hf_eval \
   bash scripts/eval.sh outputs/ouro_1.4b_w4a4/loopquant 4
 ```
@@ -167,16 +169,16 @@ python -m loopquant.cli evaluate --vllm \
   --output-dir outputs/ouro_1.4b_w4a4_vllm_eval --zero-shot --generative
 
 # Equivalent launcher for a saved snapshot; USE_VLLM defaults to 1.
-HF_ALLOW_CODE_EVAL=1 USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
+USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
   bash scripts/eval.sh outputs/ouro_1.4b_w4a4/loopquant 4
 
 # The launcher also accepts an original HF model ID or local model directory.
-HF_ALLOW_CODE_EVAL=1 USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
+USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
   bash scripts/eval.sh ByteDance/Ouro-1.4B 4
 
 # Use the original HF environment/backend (including PPL).
 conda activate loopquant
-HF_ALLOW_CODE_EVAL=1 USE_VLLM=0 \
+USE_VLLM=0 \
   bash scripts/eval.sh outputs/ouro_1.4b_w4a4/loopquant 4
 ```
 
@@ -295,8 +297,9 @@ execution environment. Native Windows code scoring is unsupported.
 
 MBPP requires both `generative.confirm_run_unsafe_code: true` in the protocol and
 `HF_ALLOW_CODE_EVAL=1` in the process environment. These switches allow execution;
-they do not create isolation. Neither shell script silently sets the environment
-variable. The scorer self-check runs when evaluation tasks are loaded.
+they do not create isolation. Both shell launchers default the environment
+variable to `1`; direct Python calls must set it explicitly. The scorer self-check
+runs when evaluation tasks are loaded.
 
 ### Prepared-model Python API
 

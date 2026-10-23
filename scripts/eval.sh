@@ -2,6 +2,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export HF_ALLOW_CODE_EVAL="${HF_ALLOW_CODE_EVAL:-1}"
 cd "${ROOT}"
 if [[ $# -lt 2 || $# -gt 3 ]]; then
   echo "Usage: CUDA_VISIBLE_DEVICES=<gpu> bash scripts/eval.sh <HF-model-ID-or-checkpoint-dir> <num-loops> [evaluation.yaml]" >&2

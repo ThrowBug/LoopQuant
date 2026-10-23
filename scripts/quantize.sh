@@ -2,6 +2,8 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export PYTHONPATH="${ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export HF_ALLOW_CODE_EVAL="${HF_ALLOW_CODE_EVAL:-1}"
 cd "${ROOT}"
 if [[ $# -lt 1 || $# -gt 2 ]]; then
   echo "Usage: CUDA_VISIBLE_DEVICES=<gpu> bash scripts/quantize.sh configs/<run>.yaml [evaluation.yaml]" >&2
