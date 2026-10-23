@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loopquant"
+version = "1.0.0"
+requires-python = ">=3.10"
+description = "Loop-aware fake quantization and evaluation for Ouro"
+
+[project.entry-points."vllm.general_plugins"]
+loopquant = "loopquant.vllm_backend:register_vllm_models"
+
+[tool.setuptools.packages.find]
+include = ["loopquant*"]

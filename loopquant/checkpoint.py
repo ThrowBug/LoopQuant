@@ -181,19 +181,65 @@ def _restore_structure(model, manifest):
         model.lctc_cgb = LoopConditionedCGB.from_model(model, manifest["num_loops"])
 
 
-def load_quantized_checkpoint(path, *, device="cuda:0", num_loops=None):
-    """Restore a snapshot without original weights, teacher, data or PTQ."""
-    from accelerate import init_empty_weights
-
+def read_checkpoint_manifest(path, *, num_loops=None):
+    """Validate a snapshot before either HF or vLLM constructs its modules."""
     directory = Path(path).expanduser().resolve()
     manifest = json.loads(_local_file(directory, MANIFEST_NAME).read_text(encoding="utf-8"))
     if manifest.get("format") != FORMAT or manifest.get("format_version") != FORMAT_VERSION:
         raise ValueError("unsupported LoopQuant checkpoint format/version")
     if num_loops is not None and num_loops != manifest["num_loops"]:
         raise ValueError(f"num_loops={num_loops} conflicts with saved num_loops={manifest['num_loops']}")
+    if not set(manifest["weight_map"].values()).issubset(manifest["files"]):
+        raise ValueError("weight index references an unverified shard")
     for name, expected in manifest["files"].items():
         if _checksum(_local_file(directory, name)) != expected:
             raise ValueError(f"checkpoint checksum mismatch: {name}")
+    return manifest
+
+
+def restore_checkpoint_tensors(model, path, manifest, *, device):
+    """Restore exact tensors/dtypes into an already reconstructed HF skeleton."""
+    directory = Path(path).expanduser().resolve()
+    expected_keys = set(model.state_dict())
+    weights = manifest["weight_map"]
+    if manifest["has_rotation"] != ("__loopquant_rotation" in weights):
+        raise ValueError("checkpoint rotation metadata does not match tensors")
+    extras = {spec["key"]: spec for spec in manifest["runtime_tensors"]}
+    if not set(extras).issubset(weights):
+        raise ValueError("checkpoint is missing runtime tensors")
+    model_keys = set(weights) - {"__loopquant_rotation"} - set(extras)
+    if expected_keys != model_keys:
+        raise ValueError(f"checkpoint tensor keys differ: missing={expected_keys - model_keys}, "
+                         f"unexpected={model_keys - expected_keys}")
+    for filename in sorted(set(weights.values())):
+        if filename not in manifest["files"]:
+            raise ValueError(f"unverified weight file: {filename}")
+        tensors = load_file(_local_file(directory, filename), device="cpu")
+        if set(tensors) != {name for name, file in weights.items() if file == filename}:
+            raise ValueError(f"weight index does not match shard: {filename}")
+        rotation = tensors.pop("__loopquant_rotation", None)
+        if rotation is not None:
+            model._loopquant_rotation = rotation.to(device)
+        for key in list(tensors):
+            if key in extras:
+                spec = extras[key]
+                setattr(model.get_submodule(spec["module"]), spec["attribute"], tensors.pop(key).to(device))
+        model.load_state_dict(tensors, strict=False, assign=True)
+        del tensors
+    for name, canonical in manifest["parameter_aliases"].items():
+        owner, _, leaf = name.rpartition(".")
+        model.get_submodule(owner)._parameters[leaf] = model.get_parameter(canonical)
+    for spec in manifest["rope_scalars"]:
+        setattr(model.get_submodule(spec["module"]), spec["attribute"], spec["value"])
+    model.to(device).requires_grad_(False).eval()
+
+
+def load_quantized_checkpoint(path, *, device="cuda:0", num_loops=None):
+    """Restore a snapshot without original weights, teacher, data or PTQ."""
+    from accelerate import init_empty_weights
+
+    directory = Path(path).expanduser().resolve()
+    manifest = read_checkpoint_manifest(directory, num_loops=num_loops)
     config = AutoConfig.from_pretrained(directory, trust_remote_code=True, local_files_only=True)
     if config.model_type != "ouro":
         raise ValueError("checkpoint format v1 supports Ouro only")
@@ -211,38 +257,7 @@ def load_quantized_checkpoint(path, *, device="cuda:0", num_loops=None):
                 attn_implementation=manifest["attn_implementation"],
             )
             _restore_structure(model, manifest)
-        expected_keys = set(model.state_dict())
-        weights = manifest["weight_map"]
-        if manifest["has_rotation"] != ("__loopquant_rotation" in weights):
-            raise ValueError("checkpoint rotation metadata does not match tensors")
-        extras = {spec["key"]: spec for spec in manifest["runtime_tensors"]}
-        if not set(extras).issubset(weights):
-            raise ValueError("checkpoint is missing runtime tensors")
-        model_keys = set(weights) - {"__loopquant_rotation"} - set(extras)
-        if expected_keys != model_keys:
-            raise ValueError(f"checkpoint tensor keys differ: missing={expected_keys - model_keys}, "
-                             f"unexpected={model_keys - expected_keys}")
-        for filename in sorted(set(weights.values())):
-            if filename not in manifest["files"]:
-                raise ValueError(f"unverified weight file: {filename}")
-            tensors = load_file(_local_file(directory, filename), device="cpu")
-            if set(tensors) != {name for name, file in weights.items() if file == filename}:
-                raise ValueError(f"weight index does not match shard: {filename}")
-            rotation = tensors.pop("__loopquant_rotation", None)
-            if rotation is not None:
-                model._loopquant_rotation = rotation.to(device)
-            for key in list(tensors):
-                if key in extras:
-                    spec = extras[key]
-                    setattr(model.get_submodule(spec["module"]), spec["attribute"], tensors.pop(key).to(device))
-            model.load_state_dict(tensors, strict=False, assign=True)
-            del tensors
-        for name, canonical in manifest["parameter_aliases"].items():
-            owner, _, leaf = name.rpartition(".")
-            model.get_submodule(owner)._parameters[leaf] = model.get_parameter(canonical)
-        for spec in manifest["rope_scalars"]:
-            setattr(model.get_submodule(spec["module"]), spec["attribute"], spec["value"])
-        model.to(device).requires_grad_(False).eval()
+        restore_checkpoint_tensors(model, directory, manifest, device=device)
         model._loopquant_rotation_seed = manifest["rotation_seed"]
         model._loopquant_model_path = str(directory)
         model._loopquant_allocation = tuple(allocation)

@@ -17,7 +17,7 @@ set +e
   --config "${config}" \
   --output-dir "${output_dir}" \
   --eval-config "${eval_config}" \
-  --save --wikitext2 --c4 --zero-shot --generative \
+  --save --wikitext2 --c4 --zero-shot \
   2>&1 | tee -a "${output_dir}/launcher.log"
 status=${PIPESTATUS[0]}
 set -e

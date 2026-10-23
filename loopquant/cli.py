@@ -1,6 +1,7 @@
 """Quantize (optionally save/evaluate), or load original/quantized weights and evaluate."""
 
 import argparse
+import json
 from pathlib import Path
 import time
 
@@ -10,6 +11,7 @@ from .config import LoopQuantConfig
 from .data import load_calibration_data
 from .evaluation import preflight_evaluation, run_evaluation
 from .evaluation_config import load_evaluation_config
+from .evaluation_results import save_json
 from .models import load_looped_transformer, load_model_for_evaluation
 from .utils import resolve_device, runtime_metadata, set_random_seed, setup_logging, write_json, write_yaml
 
@@ -27,6 +29,7 @@ def _add_quantize_arguments(parser):
 
 
 def _add_evaluate_arguments(parser):
+    parser.add_argument("--vllm", action="store_true", help="Use vLLM; skip WikiText/C4 PPL")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"),
                         help="Original HF models only; default bfloat16")
     parser.add_argument("--num-loops", type=int, required=True,
@@ -133,17 +136,47 @@ def _run_evaluate(args):
     settings = load_evaluation_config(args.eval_config)
     suites = _evaluation_suites(args)
     output = Path(args.output_dir).expanduser().resolve()
-    setup_logging(output)
-    device = resolve_device(args.device)
-    set_random_seed(settings["seed"])
-    write_yaml(output / "evaluation_config.yaml", {"evaluation": settings})
-    manager = preflight_evaluation(settings, suites=suites)
-    dtype = None if args.dtype is None else getattr(torch, args.dtype)
-    model, tokenizer, metadata = load_model_for_evaluation(
-        args.model, device=device, dtype=dtype, num_loops=args.num_loops,
-    )
-    run_evaluation(model, tokenizer, settings, output, suites=suites, device=device,
-                   task_manager=manager, run_metadata=metadata)
+    logger = setup_logging(output)
+    skipped = [name for name in suites if args.vllm and name in {"wikitext2", "c4"}]
+    suites = [name for name in suites if name not in skipped]
+    if skipped:
+        logger.info("[Evaluation] vLLM skips PPL: %s", ", ".join(skipped))
+    receipt = {"status": "running", "backend": "vllm" if args.vllm else "hf",
+               "evaluation": settings, "suites": suites, "skipped_suites": skipped,
+               "run_metadata": {"model_source": str(args.model)}, "completed": []}
+    manifest_path = output / "evaluation_manifest.json"
+    save_json(manifest_path, receipt)
+    phase = "preflight"
+    try:
+        device = resolve_device(args.device)
+        set_random_seed(settings["seed"])
+        write_yaml(output / "evaluation_config.yaml", {"evaluation": settings})
+        manager = preflight_evaluation(settings, suites=suites)
+        phase = "model_loading"
+        if args.vllm:
+            from .vllm_backend import load_vllm_backend
+            backend, metadata = load_vllm_backend(
+                args.model, settings, num_loops=args.num_loops, dtype=args.dtype, device=device,
+            )
+            phase = "evaluation"
+            run_evaluation(None, backend.tokenizer, settings, output, suites=suites, device=device,
+                           task_manager=manager, run_metadata=metadata, lm_backend=backend,
+                           backend_name="vllm", skipped_suites=skipped)
+        else:
+            dtype = None if args.dtype is None else getattr(torch, args.dtype)
+            model, tokenizer, metadata = load_model_for_evaluation(
+                args.model, device=device, dtype=dtype, num_loops=args.num_loops,
+            )
+            phase = "evaluation"
+            run_evaluation(model, tokenizer, settings, output, suites=suites, device=device,
+                           task_manager=manager, run_metadata=metadata)
+    except Exception as error:
+        current = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if current.get("status") != "failed":
+            current.update(status="failed", failed_task=phase,
+                           error=f"{type(error).__name__}: {error}")
+            save_json(manifest_path, current)
+        raise
     return 0
 
 
@@ -152,6 +185,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.command == "evaluate" and not _evaluation_requested(args):
         parser.error("evaluate requires --wikitext2, --c4, --zero-shot or --generative")
+    if args.command == "evaluate" and args.vllm and not (args.zero_shot or args.generative):
+        parser.error("--vllm skips PPL; select --zero-shot or --generative")
     if getattr(args, "num_loops", None) is not None and args.num_loops <= 0:
         parser.error("--num-loops must be positive")
     if args.command == "quantize":

@@ -1,0 +1,9 @@
+# Separate Linux/CUDA environment. Let vLLM resolve compatible Torch/Transformers.
+-e .
+vllm==0.26.0
+lm-eval==0.4.13
+evaluate==0.4.6
+datasets
+safetensors
+numpy
+pyyaml

@@ -22,6 +22,10 @@ fi
 output_dir="${LOOPQUANT_EVAL_OUTPUT_DIR:-${ROOT}/outputs/${model_key}_evaluation}"
 mkdir -p "${output_dir}"
 echo "[Evaluation] START model=${model_path}" | tee -a "${output_dir}/launcher.log"
+backend_args=()
+if [[ "${USE_VLLM:-1}" == 1 ]]; then
+  backend_args+=(--vllm)
+fi
 set +e
 "${PYTHON}" -m loopquant.cli evaluate \
   --model "${model_path}" \
@@ -29,6 +33,7 @@ set +e
   --eval-config "${eval_config}" \
   --output-dir "${output_dir}" \
   --wikitext2 --c4 --zero-shot --generative \
+  "${backend_args[@]}" \
   2>&1 | tee -a "${output_dir}/launcher.log"
 status=${PIPESTATUS[0]}
 set -e

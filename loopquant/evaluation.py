@@ -53,8 +53,6 @@ def preflight_evaluation(config, *, suites):
         return None
     try:
         from lm_eval.tasks import TaskManager
-        # Check the backend import too; a base harness install is insufficient.
-        from .harness_adapter import EvaluationHFLM  # noqa: F401
     except ImportError as error:
         raise RuntimeError("Install the pinned evaluation requirements before running evaluation") from error
     manager = TaskManager()
@@ -72,7 +70,7 @@ def preflight_evaluation(config, *, suites):
 
 def _evaluation_versions():
     result = {}
-    for package in ("torch", "transformers", "lm-eval", "evaluate", "datasets", "huggingface-hub"):
+    for package in ("torch", "transformers", "lm-eval", "evaluate", "datasets", "huggingface-hub", "vllm"):
         try:
             result[package] = version(package)
         except PackageNotFoundError:
@@ -81,7 +79,8 @@ def _evaluation_versions():
 
 
 def run_evaluation(model, tokenizer, config, output_dir, *, suites, device="cuda:0",
-                   run_metadata=None, task_manager=None):
+                   run_metadata=None, task_manager=None, lm_backend=None,
+                   backend_name="hf", skipped_suites=()):
     """Evaluate an already prepared HF model. Never loads weights or runs PTQ.
 
     Callers restoring custom checkpoints own their modules and runtime state.
@@ -89,15 +88,20 @@ def run_evaluation(model, tokenizer, config, output_dir, *, suites, device="cuda
     Results are written after every suite/task; failures are saved and re-raised.
     """
     _validate_suites(suites)
+    if backend_name == "vllm" and (lm_backend is None or set(suites) & {"wikitext2", "c4"}):
+        raise ValueError("vLLM evaluation requires a backend and excludes PPL suites")
     config = resolve_evaluation_config(config)
     output = Path(output_dir)
     logger = logging.getLogger("loopquant")
     started = time.time()
+    model_config = getattr(model, "config", None) if model is not None else getattr(lm_backend, "_config", None)
     manifest = {
         "status": "running", "evaluation": config, "suites": list(suites),
+        "backend": backend_name, "skipped_suites": list(skipped_suites),
         "run_metadata": run_metadata or {}, "versions": _evaluation_versions(),
-        "model_class": f"{type(model).__module__}.{type(model).__name__}",
-        "model_config": model.config.to_dict() if hasattr(model.config, "to_dict") else str(model.config),
+        "model_class": f"{type(model if model is not None else lm_backend).__module__}."
+                       f"{type(model if model is not None else lm_backend).__name__}",
+        "model_config": model_config.to_dict() if hasattr(model_config, "to_dict") else str(model_config),
         "tokenizer": getattr(tokenizer, "name_or_path", type(tokenizer).__name__),
         "full_eval": config["limit"] is None, "completed": [],
     }
@@ -107,7 +111,8 @@ def run_evaluation(model, tokenizer, config, output_dir, *, suites, device="cuda
     try:
         if task_manager is None:
             task_manager = preflight_evaluation(config, suites=suites)
-        model.eval()
+        if model is not None:
+            model.eval()
         for dataset in ("wikitext2", "c4"):
             if dataset in suites:
                 active = dataset
@@ -124,15 +129,16 @@ def run_evaluation(model, tokenizer, config, output_dir, *, suites, device="cuda
         generation = config["generative"]
         if "zero_shot" in suites or "generative" in suites:
             from lm_eval import evaluator
-            from .harness_adapter import EvaluationHFLM
-
-            adapter = EvaluationHFLM(
-                pretrained=model, tokenizer=tokenizer, device=device,
-                backend="causal", trust_remote_code=True,
-                batch_size=config["batch_size"], max_length=generation["max_length"],
-                generation_use_cache=generation["use_cache"],
-                allow_truncation=generation["allow_truncation"],
-            )
+            adapter = lm_backend
+            if adapter is None:
+                from .harness_adapter import EvaluationHFLM
+                adapter = EvaluationHFLM(
+                    pretrained=model, tokenizer=tokenizer, device=device,
+                    backend="causal", trust_remote_code=True,
+                    batch_size=config["batch_size"], max_length=generation["max_length"],
+                    generation_use_cache=generation["use_cache"],
+                    allow_truncation=generation["allow_truncation"],
+                )
             seed = config["seed"]
             harness_tasks = []
             if "zero_shot" in suites:
@@ -145,7 +151,10 @@ def run_evaluation(model, tokenizer, config, output_dir, *, suites, device="cuda
             for name, tasks, shots, batch_size, max_tokens in harness_tasks:
                 active = name
                 logger.info("[Evaluation] %s (fewshot=%s, batch=%s)", name, shots, batch_size)
-                adapter.batch_size_per_gpu = batch_size
+                if backend_name == "vllm":
+                    adapter.batch_size = batch_size
+                else:
+                    adapter.batch_size_per_gpu = batch_size
                 adapter.generation_receipts.clear()
                 result = evaluator.simple_evaluate(
                     model=adapter, tasks=tasks, task_manager=task_manager,
