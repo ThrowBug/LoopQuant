@@ -4,3 +4,4 @@ outputs/
 *.log
 .DS_Store
 .vscode/
+loopquant.egg-info/
