@@ -1,6 +1,12 @@
-# Separate Linux/CUDA environment. Let vLLM resolve compatible Torch/Transformers.
+# Dedicated Linux x86_64 environment with official CUDA 12.9 builds.
+# Older CUDA 12.x drivers rely on minor-version compatibility: test the engine,
+# since PTX/JIT and newer driver features can still require a driver upgrade.
+--extra-index-url https://download.pytorch.org/whl/cu129
 -e .
-vllm==0.26.0
+torch==2.11.0+cu129
+torchaudio==2.11.0+cu129
+torchvision==0.26.0+cu129
+vllm @ https://github.com/vllm-project/vllm/releases/download/v0.26.0/vllm-0.26.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl
 lm-eval==0.4.13
 evaluate==0.4.6
 datasets

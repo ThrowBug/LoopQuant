@@ -26,7 +26,8 @@ def check_vllm_environment(device):
         installed = version("vllm")
     except PackageNotFoundError as error:
         raise RuntimeError("Install requirements-vllm.txt in a separate Linux GPU environment") from error
-    if installed != VLLM_VERSION:
+    # Official CUDA variants use local versions such as 0.26.0+cu129.
+    if installed.split("+", 1)[0] != VLLM_VERSION:
         raise RuntimeError(f"Ouro integration requires vllm=={VLLM_VERSION}; found {installed}")
     if os.name == "nt" or not torch.cuda.is_available() or device not in {"cuda", "cuda:0"}:
         raise RuntimeError("vLLM requires Linux/WSL with CUDA; select the GPU using CUDA_VISIBLE_DEVICES")

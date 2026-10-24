@@ -23,6 +23,23 @@ from modeling_paged_ouro import PagedOuroConfig, PagedOuroForCausalLM
 from test_evaluation import tiny_model_and_tokenizer
 
 
+@pytest.mark.parametrize("installed,supported", [
+    ("0.26.0", True), ("0.26.0+cu129", True), ("0.26.0+cu130", True),
+    ("0.25.0", False), ("0.26.1", False), ("0.26.0rc1+cu129", False),
+])
+def test_vllm_environment_accepts_cuda_builds_of_supported_release(monkeypatch, installed, supported):
+    import loopquant.vllm_backend as loader
+    monkeypatch.setattr(loader, "version", lambda name: installed)
+    monkeypatch.setattr(loader, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(loader, "torch", SimpleNamespace(
+        cuda=SimpleNamespace(is_available=lambda: True)))
+    if supported:
+        loader.check_vllm_environment("cuda:0")
+    else:
+        with pytest.raises(RuntimeError, match="Ouro integration requires"):
+            loader.check_vllm_environment("cuda:0")
+
+
 def test_vllm_is_evaluate_only_and_rejects_ppl_only():
     base = ["--model", "unused", "--output-dir", "unused"]
     with pytest.raises(SystemExit):

@@ -126,24 +126,49 @@ The old `evaluate --run-dir` replay and `evaluate-bf16` commands are removed.
 PPL suites are skipped explicitly in the log and manifest. A PPL-only vLLM command
 is rejected. The default HF route and the quantization command are unchanged.
 
-Create a **separate Linux/CUDA Conda environment**, then from the repository root install:
+Create a **separate Linux x86_64/CUDA Conda environment**, then from the repository root install:
 
 ```bash
 conda create -n loopquant-vllm python=3.12 -y
 conda activate loopquant-vllm
-python -m pip install -r requirements-vllm.txt
+python -m pip install --upgrade -r requirements-vllm.txt
 ```
+
+`requirements-vllm.txt` pins the official
+[vLLM CUDA 12.9 wheel](https://github.com/vllm-project/vllm/releases/expanded_assets/v0.26.0)
+and matching Torch, TorchVision and TorchAudio builds. This changes packages
+only in the active environment and does not require root. Verify the installation:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 python - <<'PY'
+from importlib.metadata import version
+import torch
+
+print("Torch:", torch.__version__, "CUDA build:", torch.version.cuda)
+print("vLLM:", version("vllm"))
+torch.cuda.init()
+print("GPU:", torch.cuda.get_device_name(0))
+print("CUDA computation:", (torch.ones(1, device="cuda") + 1).item())
+import vllm._C
+PY
+```
+
+The CUDA 12.9 route relies on NVIDIA's [CUDA 12.x minor-version compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)
+on older drivers such as R550 on A800. It is a candidate installation, not a guarantee that the full
+engine runs: newer driver features and PTX/JIT compilation can still fail.
+Validate an actual vLLM run or the integration smoke test below on the server.
+Explicitly pinning the CUDA builds prevents pip from selecting CUDA 13 wheels.
 
 This pins vLLM 0.26.0 (the last release with native Ouro support) and installs the
 local package as a vLLM worker plugin. The current requirements have a concrete
 conflict: HF `requirements.txt` pins `transformers==4.55.0`, while
 [vLLM 0.26.0 requires `transformers>=5.5.3`](https://github.com/vllm-project/vllm/blob/v0.26.0/requirements/common.txt).
 Its [CUDA dependency set also pins Torch 2.11.0](https://github.com/vllm-project/vllm/blob/v0.26.0/requirements/cuda.txt).
-Do not install both requirement files into the same environment or force-install
+Do not install `requirements.txt` and `requirements-vllm.txt` into the same environment or force-install
 vLLM with `--no-deps` to retain the old Transformers pin. A shared environment is possible only after migrating
 and validating LoopQuant quantization/HF loading on a common dependency stack;
-that migration has not been validated. Let `requirements-vllm.txt` resolve the
-vLLM environment's compatible Torch/Transformers versions.
+that migration has not been validated. `requirements-vllm.txt` fixes the Torch
+CUDA builds and lets pip resolve compatible Transformers dependencies.
 The model's custom HF source must also be importable in that environment.
 The editable package entry in this file installs the same LoopQuant source into
 the new environment; it does not duplicate the model checkpoints. Keep the
