@@ -24,7 +24,7 @@ cuda-bindings==12.9.10
 # Datasets 5.1: Hub >=1.31,<3, so 1.31.0 satisfies both packages.
 transformers==5.13.0
 huggingface-hub==1.31.0
-tokenizers==0.23.0
+tokenizers==0.22.2
 safetensors==0.8.0
 accelerate==1.13.0
 sentencepiece==0.2.2
