@@ -9,10 +9,10 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 class PagedOuroConfig(PretrainedConfig):
     model_type = "ouro"
 
-    def __init__(self, **kwargs):
+    def __init__(self, num_hidden_layers=1, total_ut_steps=4, **kwargs):
         super().__init__(**kwargs)
         self.hidden_size, self.intermediate_size, self.vocab_size = 32, 64, 6
-        self.num_hidden_layers, self.total_ut_steps = 1, 4
+        self.num_hidden_layers, self.total_ut_steps = num_hidden_layers, total_ut_steps
         self.num_attention_heads, self.num_key_value_heads = 4, 2
         self.max_position_embeddings = 64
 
@@ -88,10 +88,11 @@ class MLP(nn.Module):
 
 
 class Backbone(nn.Module):
-    def __init__(self):
+    def __init__(self, config):
         super().__init__()
         self.embed_tokens, self.rotary_emb = nn.Embedding(6, 32), Rotary()
-        self.layers, self.norm = nn.ModuleList([Decoder()]), TestRMSNorm(32)
+        self.layers = nn.ModuleList([Decoder() for _ in range(config.num_hidden_layers)])
+        self.norm = TestRMSNorm(32)
 
     def forward(self, input_ids, loops):
         hidden = self.embed_tokens(input_ids)
@@ -109,7 +110,7 @@ class PagedOuroForCausalLM(PreTrainedModel):
 
     def __init__(self, config):
         super().__init__(config)
-        self.model, self.lm_head = Backbone(), nn.Linear(32, 6, bias=False)
+        self.model, self.lm_head = Backbone(config), nn.Linear(32, 6, bias=False)
         self.post_init()
 
     def forward(self, input_ids, exit_at_step=None, **kwargs):

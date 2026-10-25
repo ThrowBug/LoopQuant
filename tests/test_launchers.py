@@ -28,7 +28,7 @@ def test_shell_launchers(tmp_path, model_source):
     launcher = tmp_path / "python wrapper.sh"
     launcher.write_text(
         '#!/usr/bin/env bash\n'
-        'if [[ "$1" == "-m" ]]; then\n'
+        'if [[ "$1" == "-m" || "$1" == "-s" ]]; then\n'
         '  exec "$REAL_PYTHON" "$RECORD_SCRIPT" "$@"\n'
         'else\n'
         '  exec "$REAL_PYTHON" "$@"\n'
@@ -72,7 +72,8 @@ def test_shell_launchers(tmp_path, model_source):
         )
         assert completed.returncode == 0, completed.stderr
         args = json.loads(capture.read_text())
-        assert args[:3] == ["-m", "loopquant.cli", command]
+        prefix = (["-s"] if name == "eval" else []) + ["-m", "loopquant.cli", command]
+        assert args[:len(prefix)] == prefix
         assert args[args.index("--eval-config") + 1].replace("\\", "/").endswith("evaluation protocol.yaml")
         assert all(flag in args for flag in ("--wikitext2", "--c4", "--zero-shot"))
         if name == "quantize":
@@ -91,13 +92,15 @@ def test_shell_launchers(tmp_path, model_source):
                               "ByteDance/Ouro-1.4B", "4", protocol.as_posix()], env=env,
                              capture_output=True, text=True, encoding="utf-8", errors="replace")
     assert enabled.returncode == 0, enabled.stderr
-    assert "--vllm" in json.loads(capture.read_text())
+    args = json.loads(capture.read_text())
+    assert "--vllm" in args and args[0] == "-s"
     env["USE_VLLM"] = "0"
     disabled = subprocess.run([bash, (root / "scripts/eval.sh").as_posix(),
                                "ByteDance/Ouro-1.4B", "4", protocol.as_posix()], env=env,
                               capture_output=True, text=True, encoding="utf-8", errors="replace")
     assert disabled.returncode == 0, disabled.stderr
-    assert "--vllm" not in json.loads(capture.read_text())
+    args = json.loads(capture.read_text())
+    assert "--vllm" not in args and args[0] == "-m"
     env["LQ_EXIT"] = "7"
     failed = subprocess.run([bash, (root / "scripts/eval.sh").as_posix(),
                              "ByteDance/Ouro-1.4B", "4", protocol.as_posix()], env=env,

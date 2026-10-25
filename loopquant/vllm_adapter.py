@@ -10,6 +10,8 @@ class EvaluationVLLM(VLLM):
         super().__init__(*args, **kwargs)
 
     def generate_until(self, requests, disable_tqdm=False):
+        if not requests:
+            return []
         for request in requests:
             prompt, kwargs = request.args
             budget = int(kwargs.get("max_gen_toks", self.max_gen_toks))
@@ -28,7 +30,10 @@ class EvaluationVLLM(VLLM):
                 result = output.outputs[0]
                 self.generation_receipts.append({
                     "prompt_tokens": len(prompt), "generated_tokens": len(result.token_ids),
-                    "max_gen_toks": params.max_tokens, "finish_reason": result.finish_reason,
+                    # Harness 0.4.11 passes one SamplingParams per prompt.
+                    # Its fallback when params is None generates one token.
+                    "max_gen_toks": params.max_tokens if params is not None else 1,
+                    "finish_reason": result.finish_reason,
                     "use_cache": True, "backend": "vllm",
                 })
         return outputs

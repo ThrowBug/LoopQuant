@@ -29,6 +29,21 @@ def _validate_suites(suites):
         raise ValueError("suites must select wikitext2, c4, zero_shot or generative")
 
 
+def _task_leaves(tasks):
+    """Flatten harness task groups on both lm-eval 0.4.11 and 0.4.13."""
+    for name, task in tasks.items():
+        if isinstance(task, dict):
+            yield from _task_leaves(task)
+        else:
+            yield name, task
+
+
+def _load_tasks(manager, names):
+    if hasattr(manager, "load"):
+        return manager.load(names)["tasks"]
+    return dict(_task_leaves(manager.load_task_or_group(names)))
+
+
 def preflight_evaluation(config, *, suites):
     """Check dependencies/tasks/scorers before starting evaluation.
 
@@ -57,12 +72,12 @@ def preflight_evaluation(config, *, suites):
         raise RuntimeError("Install the pinned evaluation requirements before running evaluation") from error
     manager = TaskManager()
     if "zero_shot" in suites:
-        manager.load(ZERO_SHOT_TASKS)
+        _load_tasks(manager, ZERO_SHOT_TASKS)
     for task in entries:
-        loaded = manager.load([task["name"]])
-        if not loaded["tasks"]:
+        loaded = _load_tasks(manager, [task["name"]])
+        if not loaded:
             raise ValueError(f"No tasks resolved for {task['name']}")
-        for name, instance in loaded["tasks"].items():
+        for name, instance in loaded.items():
             if instance.get_config("output_type") != "generate_until":
                 raise ValueError(f"{name} is not a generate_until task")
     return manager

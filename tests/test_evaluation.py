@@ -187,7 +187,8 @@ def short_dataset_cache():
         yield directory
 
 
-def test_real_harness_local_dataset(tmp_path, short_dataset_cache):
+def test_real_harness_local_dataset(tmp_path, short_dataset_cache, monkeypatch):
+    import lm_eval.tasks
     from lm_eval.tasks import TaskManager
     data = tmp_path / "data.jsonl"
     data.write_text(json.dumps({"question": "hello world", "answer": "answer"}) + "\n")
@@ -212,7 +213,15 @@ def test_real_harness_local_dataset(tmp_path, short_dataset_cache):
     )
     yaml_path = task_dir / "local_generation.yaml"
     yaml_path.write_text(yaml_path.read_text().replace("'!unused'", "!function local_metrics.score"))
+    (task_dir / "local_group.yaml").write_text(yaml.safe_dump({
+        "group": "local_group", "task": ["local_generation"],
+    }))
     manager = TaskManager(include_path=str(task_dir), include_defaults=False)
+    monkeypatch.setattr(lm_eval.tasks, "TaskManager", lambda: manager)
+    # Exercise the public loader and nested group format on both harness versions.
+    assert evaluation.preflight_evaluation({"generative": {"tasks": [
+        {"name": "local_group", "num_fewshot": 0, "max_gen_toks": 4},
+    ]}}, suites=["generative"]) is manager
     model, tokenizer = tiny_model_and_tokenizer()
     config = {"generative": {"max_length": 64,
                               "tasks": [{"name": "local_generation", "num_fewshot": 0,

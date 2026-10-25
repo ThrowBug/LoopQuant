@@ -24,20 +24,30 @@ from test_evaluation import tiny_model_and_tokenizer
 
 
 @pytest.mark.parametrize("installed,supported", [
-    ("0.26.0", True), ("0.26.0+cu129", True), ("0.26.0+cu130", True),
-    ("0.25.0", False), ("0.26.1", False), ("0.26.0rc1+cu129", False),
+    ("0.11.2", True), ("0.11.2+cu128", True),
+    ("0.8.5.post1", False), ("0.11.1", False), ("0.26.0", False), ("0.11.2rc1", False),
 ])
 def test_vllm_environment_accepts_cuda_builds_of_supported_release(monkeypatch, installed, supported):
     import loopquant.vllm_backend as loader
     monkeypatch.setattr(loader, "version", lambda name: installed)
-    monkeypatch.setattr(loader, "os", SimpleNamespace(name="posix"))
+    monkeypatch.setattr(loader, "os", SimpleNamespace(name="posix", environ={}))
     monkeypatch.setattr(loader, "torch", SimpleNamespace(
         cuda=SimpleNamespace(is_available=lambda: True)))
+    monkeypatch.delenv("VLLM_USE_V1", raising=False)
     if supported:
         loader.check_vllm_environment("cuda:0")
     else:
         with pytest.raises(RuntimeError, match="Ouro integration requires"):
             loader.check_vllm_environment("cuda:0")
+
+
+def test_vllm_environment_rejects_v0_engine(monkeypatch):
+    import loopquant.vllm_backend as loader
+    monkeypatch.setattr(loader, "version", lambda name: "0.11.2")
+    monkeypatch.setattr(loader, "os", SimpleNamespace(name="posix", environ={"VLLM_USE_V1": "0"}))
+    monkeypatch.setattr(loader, "torch", SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: True)))
+    with pytest.raises(RuntimeError, match="V1 engine"):
+        loader.check_vllm_environment("cuda:0")
 
 
 def test_vllm_is_evaluate_only_and_rejects_ppl_only():
@@ -80,10 +90,13 @@ def test_early_evaluation_failure_has_manifest(tmp_path, monkeypatch, phase):
 def test_original_vllm_arguments_are_explicit(monkeypatch):
     import loopquant.vllm_backend as loader
     monkeypatch.setattr(loader.AutoConfig, "from_pretrained", lambda *a, **kw: SimpleNamespace(model_type="ouro"))
-    args, metadata = build_vllm_arguments("ByteDance/Ouro-1.4B", resolve_evaluation_config({}), num_loops=2)
+    settings = resolve_evaluation_config({"batch_size": 16, "generative": {"batch_size": 8}})
+    args, metadata = build_vllm_arguments("ByteDance/Ouro-1.4B", settings, num_loops=2)
     assert args["pretrained"] == "ByteDance/Ouro-1.4B"
     assert args["hf_overrides"] == {"total_ut_steps": 2}
     assert args["enforce_eager"] and args["tensor_parallel_size"] == 1
+    assert args["compilation_config"] == {"level": 0}
+    assert args["max_num_seqs"] == 16 and args["enable_prefix_caching"] is False
     assert metadata["mode"] == "full_precision"
     with pytest.raises(ValueError, match="always uses"):
         build_vllm_arguments("unused", resolve_evaluation_config({"generative": {"use_cache": False}}), num_loops=4)
@@ -143,6 +156,7 @@ def test_vllm_adapter_checks_budget_and_keeps_receipts(monkeypatch):
     monkeypatch.delitem(sys.modules, "loopquant.vllm_adapter", raising=False)
     try:
         adapter = importlib.import_module("loopquant.vllm_adapter").EvaluationVLLM()
+        assert adapter.generate_until([]) == []
         request = SimpleNamespace(args=("long prompt", {"max_gen_toks": 4}))
         with pytest.raises(ValueError, match="Prompt requires"):
             adapter.generate_until([request])
@@ -180,19 +194,23 @@ class ReferenceAttention(torch.nn.Module):
 
 @pytest.fixture
 def bridge_module(monkeypatch):
-    for name in ("vllm", "vllm.model_executor", "vllm.model_executor.layers", "vllm.model_executor.layers.attention"):
+    for name in ("vllm", "vllm.attention"):
         monkeypatch.setitem(sys.modules, name, ModuleType(name))
-    sys.modules["vllm.model_executor.layers.attention"].Attention = ReferenceAttention
+    sys.modules["vllm.attention"].Attention = ReferenceAttention
     # Undo the imported bridge as well, so fake vLLM does not leak to other tests.
     monkeypatch.delitem(sys.modules, "loopquant.vllm_model", raising=False)
     module = importlib.import_module("loopquant.vllm_model")
-    yield module
-    sys.modules.pop("loopquant.vllm_model", None)
+    previous = vars(QUANTIZATION_CONTEXT).copy()
+    try:
+        yield module
+    finally:
+        vars(QUANTIZATION_CONTEXT).update(previous)
+        sys.modules.pop("loopquant.vllm_model", None)
 
 
-def save_paged_model(path, allocation):
+def save_paged_model(path, allocation, *, num_layers=1):
     torch.manual_seed(27)
-    model = PagedOuroForCausalLM(PagedOuroConfig()).to(torch.bfloat16).eval()
+    model = PagedOuroForCausalLM(PagedOuroConfig(num_hidden_layers=num_layers)).to(torch.bfloat16).eval()
     configure_looped_model(model, 4)
     QUANTIZATION_CONTEXT.configure(4, allocation)
     rotate_ouro_backbone(model)
@@ -216,18 +234,20 @@ def save_paged_model(path, allocation):
 
 
 @pytest.mark.parametrize("allocation", [(4, 4, 4, 4), (8, 4, 8, 4)])
-def test_bridge_restores_prefill_and_incremental_decode(tmp_path, bridge_module, allocation):
-    original = save_paged_model(tmp_path / "loopquant", allocation)
+@pytest.mark.parametrize("num_layers", [1, 2])
+def test_bridge_restores_prefill_and_incremental_decode(tmp_path, bridge_module, allocation, num_layers):
+    original = save_paged_model(tmp_path / "loopquant", allocation, num_layers=num_layers)
     config = SimpleNamespace(
         parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
-        quant_config=None, model_config=SimpleNamespace(model=str(tmp_path / "loopquant")),
+        quant_config=None, model_config=SimpleNamespace(model=str(tmp_path / "loopquant"), dtype=torch.bfloat16),
         cache_config=None, device_config=SimpleNamespace(device="cpu"))
     bridge = bridge_module.LoopQuantOuroForCausalLM(vllm_config=config)
     bridge.load_weights(iter(()))
     for name, tensor in original.state_dict().items():
         assert torch.equal(tensor, bridge.hf_model.state_dict()[name]), name
     assert bridge.runtime.cgb.entry("model.layers.0.self_attn.q_proj", 0).clip.dtype == torch.float32
-    assert len({cache.prefix for cache in bridge.attentions}) == 4
+    assert {cache.prefix for cache in bridge.attentions} == {
+        f"model.layers.{index}.self_attn.attn" for index in range(4 * num_layers)}
     ids = torch.tensor([[3, 4, 3]])
     with torch.no_grad():
         expected = original(ids).logits[0].float()
@@ -237,9 +257,31 @@ def test_bridge_restores_prefill_and_incremental_decode(tmp_path, bridge_module,
         expected = original(extended).logits[0, -1].float()
         decoded = bridge.compute_logits(bridge(torch.tensor([4]), torch.tensor([3])))[0]
         torch.testing.assert_close(expected, decoded, rtol=0, atol=0)
+        assert all(cache.keys.shape[1] == 4 for cache in bridge.attentions)
     args, metadata = build_vllm_arguments(tmp_path / "loopquant", resolve_evaluation_config({}), num_loops=4)
     assert args["dtype"] == "bfloat16"
     assert args["hf_overrides"]["architectures"] == ["LoopQuantOuroForCausalLM"]
     assert metadata["allocation"] == list(allocation)
     with pytest.raises(ValueError, match="conflicts"):
         build_vllm_arguments(tmp_path / "loopquant", resolve_evaluation_config({}), num_loops=2)
+
+
+def test_bridge_rejects_dtype_override_and_restores_quantization_context(tmp_path, bridge_module):
+    save_paged_model(tmp_path / "loopquant", (4, 4, 4, 4))
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
+        quant_config=None,
+        model_config=SimpleNamespace(model=str(tmp_path / "loopquant"), dtype=torch.float16),
+        cache_config=None, device_config=SimpleNamespace(device="cpu"))
+    bridge = bridge_module.LoopQuantOuroForCausalLM(vllm_config=config)
+    with pytest.raises(ValueError, match="dtype must match"):
+        bridge.load_weights(iter(()))
+    bridge.dtype = torch.bfloat16
+    bridge.load_weights(iter(()))
+    QUANTIZATION_CONTEXT.configure(2, (8, 16))
+    QUANTIZATION_CONTEXT.current_loop = 1
+    QUANTIZATION_CONTEXT.enabled = False
+    with torch.no_grad():
+        bridge(torch.tensor([3]), torch.tensor([0]))
+    assert (QUANTIZATION_CONTEXT.num_loops, QUANTIZATION_CONTEXT.current_loop,
+            QUANTIZATION_CONTEXT.activation_bits, QUANTIZATION_CONTEXT.enabled) == (2, 1, (8, 16), False)

@@ -1,39 +1,207 @@
-# Linux x86_64 / Python 3.12 / NVIDIA driver 550.163.01 (CUDA 12.4).
-# CUDA 12.9 relies on CUDA 12.x minor-version compatibility on this driver;
-# this is not a GPU-validated lockfile. Do not substitute CUDA 13 wheels.
+# Runtime lock: CPython 3.12, Linux x86_64, glibc >=2.28.
+# Target: native Ouro in vLLM 0.11.2 and PyTorch 2.9.0 / CUDA 12.8.
+# Resolved from published metadata; all transitive runtime versions are pinned.
+# Driver 550.163.01 relies on CUDA 12.x minor compatibility; GPU validation is still required.
+# Install this file alone in a fresh environment. requirements.txt specifies a different HF stack.
 --index-url https://mirrors.aliyun.com/pypi/simple/
---extra-index-url https://download.pytorch.org/whl/cu129
---extra-index-url https://download.pytorch.org/whl/cpu
 -e .
 
-# The current Ouro adapter requires vLLM 0.26.0. Its official GPU wheels
-# provide CUDA 12.9 or 13.0; the cu129 wheel is hosted on GitHub, not PyPI.
-# Scope the GitHub proxy to this wheel; its hash matches the upstream release.
-vllm @ https://gh-proxy.org/https://github.com/vllm-project/vllm/releases/download/v0.26.0/vllm-0.26.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl#sha256=6ce4ca30616f0a35810391015622b197a7b8b267ed27f8716f0789db79ff578b
-torch==2.11.0+cu129
-torchaudio==2.11.0+cu129
-torchvision==0.26.0+cu129
-triton==3.6.0
+# Engine and CUDA 12.x tooling
+vllm==0.11.2
+torch==2.9.0
+torchaudio==2.9.0
+torchvision==0.24.0
+xformers==0.0.33.post1
+triton==3.5.0
+flashinfer-python==0.5.2
+nvidia-cutlass-dsl==4.3.1
+cuda-python==12.8.0
+cuda-bindings==12.8.0
 
-# Satisfy vLLM's codec dependency without loading CUDA 13 codec libraries.
-torchcodec==0.14.0+cpu
-cuda-python==12.9.7
-cuda-bindings==12.9.10
+# Hugging Face model stack
+transformers==4.57.1
+tokenizers==0.22.1
+huggingface-hub==0.36.0
+accelerate==1.11.0
+peft==0.17.1
+safetensors==0.6.2
+sentencepiece==0.2.1
 
-# Transformers 5.13: Hub >=1.5,<2 and Tokenizers >=0.22,<=0.23.0.
-# Datasets 5.1: Hub >=1.31,<3, so 1.31.0 satisfies both packages.
-transformers==5.13.0
-huggingface-hub==1.31.0
-tokenizers==0.22.2
-safetensors==0.8.0
-accelerate==1.13.0
-sentencepiece==0.2.2
-
-# Pin the evaluation packages; resolve remaining transitive dependencies
-# within these packages' declared constraints.
-lm-eval==0.4.13
-datasets==5.1.0
+# Evaluation stack
+lm-eval[hf,vllm]==0.4.11
+datasets==4.4.1
 evaluate==0.4.6
-numpy==2.3.5
+numpy==2.2.6
+numba==0.61.2
+llvmlite==0.44.0
+
+# Packaging tools
+pip==25.3
+setuptools==80.9.0
+wheel==0.45.1
+
+# Remaining transitive runtime dependencies
+absl-py==2.3.1
+aiohappyeyeballs==2.6.1
+aiohttp==3.13.2
+aiosignal==1.4.0
+annotated-doc==0.0.4
+annotated-types==0.7.0
+anthropic==0.71.0
+anyio==4.12.0
+apache-tvm-ffi==0.1.4
+astor==0.8.1
+attrs==25.4.0
+blake3==1.0.8
+cachetools==6.2.2
+cbor2==5.7.1
+certifi==2025.11.12
+chardet==5.2.0
+charset-normalizer==3.4.4
+click==8.2.1
+cloudpickle==3.1.2
+colorama==0.4.6
+compressed-tensors==0.12.2
+cupy-cuda12x==13.6.0
+dataproperty==1.1.0
+depyf==0.20.0
+dill==0.4.0
+diskcache==5.6.3
+distro==1.9.0
+dnspython==2.8.0
+docstring-parser==0.17.0
+einops==0.8.1
+email-validator==2.3.0
+fastapi[standard]==0.123.0
+fastapi-cli[standard]==0.0.16
+fastapi-cloud-cli==0.5.2
+fastar==0.8.0
+fastrlock==0.8.3
+filelock==3.20.0
+frozenlist==1.8.0
+fsspec[http]==2025.10.0
+gguf==0.17.1
+h11==0.16.0
+hf-xet==1.2.0
+httpcore==1.0.9
+httptools==0.7.1
+httpx==0.28.1
+idna==3.11
+interegular==0.3.3
+jinja2==3.1.6
+jiter==0.12.0
+jmespath==1.0.1
+joblib==1.5.2
+jsonlines==4.0.0
+jsonschema==4.25.1
+jsonschema-specifications==2025.9.1
+lark==1.2.2
+llguidance==1.3.0
+lm-format-enforcer==0.11.3
+loguru==0.7.3
+lxml==6.0.2
+markdown-it-py==4.0.0
+markupsafe==3.0.3
+mbstrdecoder==1.1.4
+mdurl==0.1.2
+mistral-common[image]==1.8.6
+model-hosting-container-standards==0.1.9
+more-itertools==10.8.0
+mpmath==1.3.0
+msgpack==1.1.2
+msgspec==0.20.0
+multidict==6.7.0
+multiprocess==0.70.18
+networkx==3.6
+ninja==1.13.0
+nltk==3.9.2
+nvidia-cublas-cu12==12.8.4.1
+nvidia-cuda-cupti-cu12==12.8.90
+nvidia-cuda-nvrtc-cu12==12.8.93
+nvidia-cuda-runtime-cu12==12.8.90
+nvidia-cudnn-cu12==9.10.2.21
+nvidia-cudnn-frontend==1.16.0
+nvidia-cufft-cu12==11.3.3.83
+nvidia-cufile-cu12==1.13.1.3
+nvidia-curand-cu12==10.3.9.90
+nvidia-cusolver-cu12==11.7.3.90
+nvidia-cusparse-cu12==12.5.8.93
+nvidia-cusparselt-cu12==0.7.1
+nvidia-ml-py==13.580.82
+nvidia-nccl-cu12==2.27.5
+nvidia-nvjitlink-cu12==12.8.93
+nvidia-nvshmem-cu12==3.3.20
+nvidia-nvtx-cu12==12.8.90
+openai==2.8.1
+openai-harmony==0.0.8
+opencv-python-headless==4.12.0.88
+outlines-core==0.2.11
+packaging==25.0
+pandas==2.3.3
+partial-json-parser==0.2.1.1.post7
+pathvalidate==3.3.1
+pillow==12.0.0
+portalocker==3.2.0
+prometheus-client==0.23.1
+prometheus-fastapi-instrumentator==7.1.0
+propcache==0.4.1
+protobuf==6.33.1
+psutil==7.1.3
+py-cpuinfo==9.0.0
+pyarrow==22.0.0
+pybase64==1.4.2
+pycountry==24.6.1
+pydantic[email]==2.12.5
+pydantic-core==2.41.5
+pydantic-extra-types[pycountry]==2.10.6
+pygments==2.19.2
+pytablewriter==1.2.1
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.1
+python-json-logger==4.0.0
+python-multipart==0.0.20
+pytz==2025.2
 pyyaml==6.0.3
-absl-py==2.5.1
+pyzmq==27.1.0
+ray[cgraph]==2.52.1
+referencing==0.37.0
+regex==2025.11.3
+requests==2.32.5
+rich==14.2.0
+rich-toolkit==0.17.0
+rignore==0.7.6
+rouge-score==0.1.2
+rpds-py==0.30.0
+sacrebleu==2.5.1
+scikit-learn==1.7.2
+scipy==1.16.3
+sentry-sdk==2.46.0
+setproctitle==1.3.7
+shellingham==1.5.4
+six==1.17.0
+sniffio==1.3.1
+sqlitedict==2.1.0
+starlette==0.50.0
+supervisor==4.3.0
+sympy==1.14.0
+tabledata==1.3.4
+tabulate==0.9.0
+tcolorpy==0.1.7
+threadpoolctl==3.6.0
+tiktoken==0.12.0
+tqdm==4.67.1
+typepy[datetime]==1.3.4
+typer==0.20.0
+typing-extensions==4.15.0
+typing-inspection==0.4.2
+tzdata==2025.2
+urllib3==2.5.0
+uvicorn[standard]==0.38.0
+uvloop==0.22.1
+watchfiles==1.1.1
+websockets==15.0.1
+word2number==1.1
+xgrammar==0.1.25
+xxhash==3.6.0
+yarl==1.22.0
+zstandard==0.25.0

@@ -12,7 +12,7 @@ import torch
 from torch import nn
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModelForCausalLM
-from vllm.model_executor.layers.attention import Attention
+from vllm.attention import Attention
 
 from .checkpoint import read_checkpoint_manifest, restore_checkpoint_tensors, _restore_structure
 from .lctc import ACTIVE_LCTC_RUNTIME, _LCTCRuntime
@@ -45,7 +45,7 @@ def attach_paged_attention(model, cache_config, *, prefix=""):
         per_loop = []
         for loop in range(model._loopquant_num_loops):
             per_loop.append(Attention(
-                config.num_attention_heads, head_dim, head_dim ** -0.5,
+                config.num_attention_heads, head_dim, getattr(attention, "scaling", head_dim ** -0.5),
                 num_kv_heads=config.num_key_value_heads, cache_config=cache_config,
                 per_layer_sliding_window=getattr(attention, "sliding_window", None),
                 prefix=f"{prefix}model.layers.{loop * count + index}.self_attn.attn",
@@ -89,17 +89,19 @@ class LoopQuantOuroForCausalLM(nn.Module):
         self.directory = source
         self.manifest = read_checkpoint_manifest(source)
         self.device = vllm_config.device_config.device
+        self.dtype = vllm_config.model_config.dtype
+        self.num_loops = int(self.manifest["num_loops"])
         config = AutoConfig.from_pretrained(source, trust_remote_code=True, local_files_only=True)
-        if config.model_type != "ouro" or config.total_ut_steps != self.manifest["num_loops"]:
+        if config.model_type != "ouro" or config.total_ut_steps != self.num_loops:
             raise ValueError("checkpoint config and Ouro loop count must match")
         self.config = config
-        QUANTIZATION_CONTEXT.configure(self.manifest["num_loops"], self.manifest["allocation"])
+        QUANTIZATION_CONTEXT.configure(self.num_loops, self.manifest["allocation"])
         with init_empty_weights(include_buffers=False):
             self.hf_model = AutoModelForCausalLM.from_config(
                 config, trust_remote_code=True, attn_implementation="eager",
             )
             _restore_structure(self.hf_model, self.manifest)
-        self.hf_model._loopquant_num_loops = self.manifest["num_loops"]
+        self.hf_model._loopquant_num_loops = self.num_loops
         self.attentions = attach_paged_attention(
             self.hf_model, vllm_config.cache_config, prefix=f"{prefix}." if prefix else "",
         )
@@ -110,6 +112,8 @@ class LoopQuantOuroForCausalLM(nn.Module):
         # Use the verified manifest/index, not vLLM's standard HF name mapping.
         # The supplied iterator is lazy and is intentionally not consumed.
         restore_checkpoint_tensors(self.hf_model, self.directory, self.manifest, device=self.device)
+        if self.hf_model.model.embed_tokens.weight.dtype != self.dtype:
+            raise ValueError("vLLM dtype must match the saved checkpoint embedding dtype")
         return {name for name, _ in self.named_parameters()}
 
     def embed_input_ids(self, input_ids):
@@ -122,11 +126,13 @@ class LoopQuantOuroForCausalLM(nn.Module):
         hidden = (self.embed_input_ids(input_ids) if inputs_embeds is None else inputs_embeds).unsqueeze(0)
         position_ids = positions.unsqueeze(0)
         position_embeddings = core.rotary_emb(hidden, position_ids)
-        QUANTIZATION_CONTEXT.configure(self.manifest["num_loops"], self.manifest["allocation"])
+        previous = (QUANTIZATION_CONTEXT.num_loops, QUANTIZATION_CONTEXT.current_loop,
+                    QUANTIZATION_CONTEXT.activation_bits, QUANTIZATION_CONTEXT.enabled)
+        QUANTIZATION_CONTEXT.configure(self.num_loops, self.manifest["allocation"])
         QUANTIZATION_CONTEXT.enabled = True
         token = ACTIVE_LCTC_RUNTIME.set(self.runtime)
         try:
-            for loop in range(self.manifest["num_loops"]):
+            for loop in range(self.num_loops):
                 QUANTIZATION_CONTEXT.current_loop = loop
                 for layer in core.layers:
                     hidden = layer(hidden, attention_mask=None, position_ids=position_ids,
@@ -135,6 +141,8 @@ class LoopQuantOuroForCausalLM(nn.Module):
                 hidden = core.norm(hidden)
         finally:
             ACTIVE_LCTC_RUNTIME.reset(token)
+            (QUANTIZATION_CONTEXT.num_loops, QUANTIZATION_CONTEXT.current_loop,
+             QUANTIZATION_CONTEXT.activation_bits, QUANTIZATION_CONTEXT.enabled) = previous
         return hidden.squeeze(0)
 
     def compute_logits(self, hidden_states):

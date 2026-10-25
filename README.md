@@ -131,16 +131,22 @@ Create a **separate Linux x86_64/CUDA Conda environment**, then from the reposit
 ```bash
 conda create -n loopquant-vllm python=3.12 -y
 conda activate loopquant-vllm
-python -m pip install --upgrade -r requirements-vllm.txt
+python -I -m pip --isolated install --no-user \
+  -i https://mirrors.aliyun.com/pypi/simple/ -r requirements-vllm.txt
+python -I -m pip check
 ```
 
-`requirements-vllm.txt` pins the official
-[vLLM CUDA 12.9 wheel](https://github.com/vllm-project/vllm/releases/expanded_assets/v0.26.0)
-and matching Torch, TorchVision and TorchAudio builds. This changes packages
-only in the active environment and does not require root. Verify the installation:
+`requirements-vllm.txt` locks vLLM 0.11.2, Torch 2.9.0 (CUDA 12.8),
+Transformers 4.57.1 and lm-eval 0.4.11, including their transitive dependencies.
+The standard PyPI wheels are installed through Aliyun; no GitHub wheel URL is
+needed. The target is CPython 3.12, Linux x86_64 and glibc >= 2.28. Installation
+does not require root. Use a fresh environment: reinstalling into one with missing
+package metadata/RECORD files is not a supported repair procedure.
+`-I` hides user-site packages and `PYTHONPATH`; `--isolated --no-user` prevents
+user pip settings from redirecting the installation. Verify the installation:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python - <<'PY'
+CUDA_VISIBLE_DEVICES=0 python -I - <<'PY'
 from importlib.metadata import version
 import torch
 
@@ -153,27 +159,21 @@ import vllm._C
 PY
 ```
 
-The CUDA 12.9 route relies on NVIDIA's [CUDA 12.x minor-version compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)
+The CUDA 12.8 route relies on NVIDIA's [CUDA 12.x minor-version compatibility](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html)
 on older drivers such as R550 on A800. It is a candidate installation, not a guarantee that the full
 engine runs: newer driver features and PTX/JIT compilation can still fail.
 Validate an actual vLLM run or the integration smoke test below on the server.
-Explicitly pinning the CUDA builds prevents pip from selecting CUDA 13 wheels.
+The lock keeps CUDA runtime dependencies on CUDA 12.x. Dependency resolution
+does not validate GPU kernels on the server.
 
-This pins vLLM 0.26.0 (the last release with native Ouro support) and installs the
-local package as a vLLM worker plugin. The current requirements have a concrete
-conflict: HF `requirements.txt` pins `transformers==4.55.0`, while
-[vLLM 0.26.0 requires `transformers>=5.5.3`](https://github.com/vllm-project/vllm/blob/v0.26.0/requirements/common.txt).
-Its [CUDA dependency set also pins Torch 2.11.0](https://github.com/vllm-project/vllm/blob/v0.26.0/requirements/cuda.txt).
-Do not install `requirements.txt` and `requirements-vllm.txt` into the same environment or force-install
-vLLM with `--no-deps` to retain the old Transformers pin. A shared environment is possible only after migrating
-and validating LoopQuant quantization/HF loading on a common dependency stack;
-that migration has not been validated. `requirements-vllm.txt` fixes the Torch
-CUDA builds and lets pip resolve compatible Transformers dependencies.
-The model's custom HF source must also be importable in that environment.
-The editable package entry in this file installs the same LoopQuant source into
-the new environment; it does not duplicate the model checkpoints. Keep the
-original `loopquant` environment for quantization/HF evaluation, and activate
-`loopquant-vllm` for vLLM evaluation.
+Original HF weights use vLLM's [native Ouro model](https://github.com/vllm-project/vllm/blob/v0.11.2/vllm/model_executor/models/ouro.py).
+LoopQuant snapshots select the custom worker plugin installed by the editable
+`-e .` entry. Both routes use vLLM's V1 engine; unset `VLLM_USE_V1=0` if present.
+Keep `loopquant` for quantization/HF evaluation and `loopquant-vllm` for vLLM
+evaluation. Their Transformers/lm-eval pins differ; install only the appropriate
+requirements file in each environment. The shared evaluation code supports both
+harness versions. The model's custom HF source must be importable; saved
+LoopQuant directories already include it.
 
 ```bash
 # Run from the LoopQuant repository root in the vLLM environment.
@@ -181,14 +181,14 @@ conda activate loopquant-vllm
 
 # Original BF16 model: zero-shot + all configured generative tasks, including MBPP.
 HF_ALLOW_CODE_EVAL=1 CUDA_VISIBLE_DEVICES=0 \
-python -m loopquant.cli evaluate --vllm \
+python -s -m loopquant.cli evaluate --vllm \
   --model ByteDance/Ouro-1.4B --num-loops 4 \
   --eval-config configs/evaluation_generative.yaml \
   --output-dir outputs/ouro_bf16_vllm --zero-shot --generative
 
 # Saved LoopQuant model: load the existing snapshot, then evaluate through vLLM.
 HF_ALLOW_CODE_EVAL=1 CUDA_VISIBLE_DEVICES=0 \
-python -m loopquant.cli evaluate --vllm \
+python -s -m loopquant.cli evaluate --vllm \
   --model outputs/ouro_1.4b_w4a4/loopquant --num-loops 4 \
   --eval-config configs/evaluation_generative.yaml \
   --output-dir outputs/ouro_1.4b_w4a4_vllm_eval --zero-shot --generative
@@ -218,7 +218,9 @@ CGB parameters). Only attention execution is replaced by vLLM paged attention;
 each physical layer and recurrent loop has its own cache entry. The existing
 manifest/safetensors format is reused. No packed INT4 kernel is introduced.
 
-The first implementation is single-GPU, eager, with prefix caching disabled.
+The integration is single-GPU, eager, with torch.compile, CUDA Graph and prefix caching disabled.
+The vLLM launcher uses `python -s` to keep packages in `~/.local` out of the
+runtime import path. Direct CLI examples use the same option.
 Engine seed, context budget, task batch sizes and truncation policy follow the
 evaluation protocol. vLLM always uses its KV cache, so `generative.use_cache: false`
 is rejected rather than silently ignored. `CUDA_VISIBLE_DEVICES` selects the GPU;
@@ -227,15 +229,20 @@ versions and per-request generation receipts are saved. Preflight and model-load
 failures also produce a failed manifest.
 
 CPU reference tests cover tensor restoration, RoPE, recurrent prefill and
-incremental decode with W4A4/mixed W4A6 and LCTC. They do **not** exercise the real
+incremental decode with W4A4/mixed A4/A8 and LCTC. They do **not** exercise the real
 CUDA paged-attention implementation. Run the optional integration smoke test in
 the target vLLM environment before relying on benchmark results; actual Ouro
 GPU accuracy/performance remains an acceptance check, not a claim of these tests.
 
 ```bash
-pip install pytest
+python -I -m pip --isolated install --no-user -i https://mirrors.aliyun.com/pypi/simple/ pytest
 LOOPQUANT_VLLM_TEST_MODEL=/path/to/loopquant \
-  python -m pytest tests/test_vllm_gpu.py -q
+  python -s -m pytest tests/test_vllm_gpu.py -q
+
+# Repeat for the original HF model and saved snapshots. Optional HF score
+# comparison loads another model copy on the GPU and checks numerical agreement.
+LOOPQUANT_VLLM_TEST_MODEL=ByteDance/Ouro-1.4B LOOPQUANT_VLLM_COMPARE_HF=1 \
+  python -s -m pytest tests/test_vllm_gpu.py -q
 ```
 
 ## Checkpoint format

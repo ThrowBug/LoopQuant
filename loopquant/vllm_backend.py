@@ -11,7 +11,7 @@ from transformers import AutoConfig
 from .checkpoint import MANIFEST_NAME, read_checkpoint_manifest
 
 
-VLLM_VERSION = "0.26.0"
+VLLM_VERSION = "0.11.2"
 MODEL_ARCHITECTURE = "LoopQuantOuroForCausalLM"
 
 
@@ -26,11 +26,13 @@ def check_vllm_environment(device):
         installed = version("vllm")
     except PackageNotFoundError as error:
         raise RuntimeError("Install requirements-vllm.txt in a separate Linux GPU environment") from error
-    # Official CUDA variants use local versions such as 0.26.0+cu129.
+    # Local build suffixes do not change the supported Python model API.
     if installed.split("+", 1)[0] != VLLM_VERSION:
         raise RuntimeError(f"Ouro integration requires vllm=={VLLM_VERSION}; found {installed}")
     if os.name == "nt" or not torch.cuda.is_available() or device not in {"cuda", "cuda:0"}:
         raise RuntimeError("vLLM requires Linux/WSL with CUDA; select the GPU using CUDA_VISIBLE_DEVICES")
+    if os.environ.get("VLLM_USE_V1", "1") == "0":
+        raise RuntimeError("LoopQuant vLLM evaluation requires the V1 engine; unset VLLM_USE_V1=0")
 
 
 def build_vllm_arguments(source, config, *, num_loops, dtype=None):
@@ -62,8 +64,12 @@ def build_vllm_arguments(source, config, *, num_loops, dtype=None):
         "pretrained": source, "dtype": dtype or "bfloat16", "trust_remote_code": True,
         "tensor_parallel_size": 1, "data_parallel_size": 1,
         "max_model_len": generation["max_length"], "batch_size": config["batch_size"],
+        "max_num_seqs": max(config["batch_size"], generation["batch_size"]),
         "gpu_memory_utilization": 0.8, "seed": config["seed"],
         "hf_overrides": overrides, "enforce_eager": True,
+        # Eager execution also excludes torch.compile: Python loop state and
+        # LCTC's ContextVar must be read on every forward, not captured once.
+        "compilation_config": {"level": 0},
         "enable_prefix_caching": False,
         # Weight dtype does not describe FP32 CGB tables, so never run a second
         # model-wide cast or online quantizer after restoring our saved tensors.
@@ -82,7 +88,7 @@ def load_vllm_backend(source, config, *, num_loops, dtype=None, device="cuda:0")
     arguments, metadata = build_vllm_arguments(source, config, num_loops=num_loops, dtype=dtype)
     if metadata["fake_quantization"]:
         if not any(entry.name == "loopquant" for entry in entry_points(group="vllm.general_plugins")):
-            raise RuntimeError("Register worker plugins first: pip install -e . --no-deps")
+            raise RuntimeError("Install requirements-vllm.txt, including its editable LoopQuant worker plugin")
         if "VLLM_PLUGINS" in os.environ:
             plugins = set(filter(None, os.environ["VLLM_PLUGINS"].split(",")))
             os.environ["VLLM_PLUGINS"] = ",".join(sorted(plugins | {"loopquant"}))
