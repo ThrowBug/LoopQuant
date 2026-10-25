@@ -18,16 +18,23 @@ MODEL_ARCHITECTURE = "LoopQuantOuroForCausalLM"
 
 @contextmanager
 def _vllm_subprocess_environment():
-    """vLLM's registry starts Python without propagating the parent's -s flag."""
-    previous = os.environ.get("PYTHONNOUSERSITE")
-    os.environ["PYTHONNOUSERSITE"] = "1"
+    """Keep registry/engine children isolated from user packages and CUDA state."""
+    settings = {
+        # The registry invokes Python without propagating the parent's -s.
+        "PYTHONNOUSERSITE": "1",
+        # CUDA availability checks can poison fork even before is_initialized().
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    }
+    previous = {key: os.environ.get(key) for key in settings}
+    os.environ.update(settings)
     try:
         yield
     finally:
-        if previous is None:
-            os.environ.pop("PYTHONNOUSERSITE", None)
-        else:
-            os.environ["PYTHONNOUSERSITE"] = previous
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def register_vllm_models():

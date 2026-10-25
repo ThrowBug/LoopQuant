@@ -121,15 +121,20 @@ def test_backend_factory_preserves_effective_config(monkeypatch):
     assert backend._config.total_ut_steps == metadata["num_loops"] == 2
 
 
-@pytest.mark.parametrize("previous", [None, "0", "1"])
+@pytest.mark.parametrize("previous,previous_method", [(None, None), ("0", "fork"), ("1", "spawn")])
 @pytest.mark.parametrize("snapshot", [False, True])
 @pytest.mark.parametrize("fail", [False, True])
-def test_backend_isolates_plain_python_children_and_restores_environment(monkeypatch, previous, snapshot, fail):
+def test_backend_isolates_plain_python_children_and_restores_environment(
+        monkeypatch, previous, previous_method, snapshot, fail):
     import loopquant.vllm_backend as loader
     if previous is None:
         monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
     else:
         monkeypatch.setenv("PYTHONNOUSERSITE", previous)
+    if previous_method is None:
+        monkeypatch.delenv("VLLM_WORKER_MULTIPROC_METHOD", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_WORKER_MULTIPROC_METHOD", previous_method)
     monkeypatch.setattr(loader, "check_vllm_environment", lambda device: None)
     monkeypatch.setattr(loader, "build_vllm_arguments", lambda *a, **kw: (
         {"hf_overrides": {"total_ut_steps": 2}}, {"fake_quantization": snapshot}))
@@ -137,15 +142,17 @@ def test_backend_isolates_plain_python_children_and_restores_environment(monkeyp
 
     def register():
         assert os.environ["PYTHONNOUSERSITE"] == "1"
+        assert os.environ["VLLM_WORKER_MULTIPROC_METHOD"] == "spawn"
     monkeypatch.setattr(loader, "register_vllm_models", register)
 
     def construct(**kwargs):
         # Reproduce the registry's plain `python -m ...` subprocess: no -s.
         output = subprocess.check_output([sys.executable, "-c",
-            "import json, os, site, sys; print(json.dumps(["
-            "os.environ.get('PYTHONNOUSERSITE'), sys.flags.no_user_site, site.ENABLE_USER_SITE]))"],
+            "import json, multiprocessing as mp, os, site, sys; print(json.dumps(["
+            "os.environ.get('PYTHONNOUSERSITE'), sys.flags.no_user_site, site.ENABLE_USER_SITE,"
+            "mp.get_context(os.environ['VLLM_WORKER_MULTIPROC_METHOD']).get_start_method()]))"],
             text=True)
-        assert json.loads(output) == ["1", 1, False]
+        assert json.loads(output) == ["1", 1, False, "spawn"]
         if fail:
             raise RuntimeError("engine initialization failed")
         return SimpleNamespace(_config=SimpleNamespace())
@@ -160,6 +167,32 @@ def test_backend_isolates_plain_python_children_and_restores_environment(monkeyp
         backend, _ = loader.load_vllm_backend("unused", resolve_evaluation_config({}), num_loops=2)
         assert backend._config.total_ut_steps == 2
     assert os.environ.get("PYTHONNOUSERSITE") == previous
+    assert os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") == previous_method
+
+
+def test_engine_spawn_starts_with_fresh_process_state(tmp_path):
+    from loopquant.vllm_backend import _vllm_subprocess_environment
+
+    script = tmp_path / "spawn_probe.py"
+    script.write_text(
+        "import json, multiprocessing as mp, os, site\n"
+        "state = 'fresh'\n"
+        "def inspect_child(queue):\n"
+        "    queue.put([mp.get_start_method(), state, site.ENABLE_USER_SITE])\n"
+        "if __name__ == '__main__':\n"
+        "    state = 'parent runtime initialized'\n"
+        "    context = mp.get_context(os.environ['VLLM_WORKER_MULTIPROC_METHOD'])\n"
+        "    queue = context.Queue()\n"
+        "    child = context.Process(target=inspect_child, args=(queue,))\n"
+        "    child.start()\n"
+        "    result = queue.get(timeout=10)\n"
+        "    child.join(timeout=10)\n"
+        "    assert child.exitcode == 0\n"
+        "    print(json.dumps(result))\n",
+        encoding="utf-8")
+    with _vllm_subprocess_environment():
+        output = subprocess.check_output([sys.executable, str(script)], text=True, timeout=30)
+    assert json.loads(output) == ["spawn", "fresh", False]
 
 
 def test_vllm_runner_uses_shared_task_protocol_and_records_backend(tmp_path, monkeypatch):
