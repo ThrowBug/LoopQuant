@@ -4,12 +4,12 @@
 --index-url https://mirrors.aliyun.com/pypi/simple/
 --extra-index-url https://download.pytorch.org/whl/cu129
 --extra-index-url https://download.pytorch.org/whl/cpu
---find-links https://github.com/vllm-project/vllm/releases/expanded_assets/v0.26.0
 -e .
 
 # The current Ouro adapter requires vLLM 0.26.0. Its official GPU wheels
 # provide CUDA 12.9 or 13.0; the cu129 wheel is hosted on GitHub, not PyPI.
-vllm==0.26.0+cu129
+# Scope the GitHub proxy to this wheel; its hash matches the upstream release.
+vllm @ https://gh-proxy.org/https://github.com/vllm-project/vllm/releases/download/v0.26.0/vllm-0.26.0+cu129-cp38-abi3-manylinux_2_28_x86_64.whl#sha256=6ce4ca30616f0a35810391015622b197a7b8b267ed27f8716f0789db79ff578b
 torch==2.11.0+cu129
 torchaudio==2.11.0+cu129
 torchvision==0.26.0+cu129
