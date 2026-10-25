@@ -1,6 +1,7 @@
 """Lazy vLLM construction; importing this module does not require vLLM."""
 
 import os
+from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, entry_points, version
 from pathlib import Path
 
@@ -13,6 +14,20 @@ from .checkpoint import MANIFEST_NAME, read_checkpoint_manifest
 
 VLLM_VERSION = "0.11.2"
 MODEL_ARCHITECTURE = "LoopQuantOuroForCausalLM"
+
+
+@contextmanager
+def _vllm_subprocess_environment():
+    """vLLM's registry starts Python without propagating the parent's -s flag."""
+    previous = os.environ.get("PYTHONNOUSERSITE")
+    os.environ["PYTHONNOUSERSITE"] = "1"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("PYTHONNOUSERSITE", None)
+        else:
+            os.environ["PYTHONNOUSERSITE"] = previous
 
 
 def register_vllm_models():
@@ -69,7 +84,7 @@ def build_vllm_arguments(source, config, *, num_loops, dtype=None):
         "hf_overrides": overrides, "enforce_eager": True,
         # Eager execution also excludes torch.compile: Python loop state and
         # LCTC's ContextVar must be read on every forward, not captured once.
-        "compilation_config": {"level": 0},
+        "compilation_config": {"mode": 0},
         "enable_prefix_caching": False,
         # Weight dtype does not describe FP32 CGB tables, so never run a second
         # model-wide cast or online quantizer after restoring our saved tensors.
@@ -86,15 +101,16 @@ def build_vllm_arguments(source, config, *, num_loops, dtype=None):
 def load_vllm_backend(source, config, *, num_loops, dtype=None, device="cuda:0"):
     check_vllm_environment(device)
     arguments, metadata = build_vllm_arguments(source, config, num_loops=num_loops, dtype=dtype)
-    if metadata["fake_quantization"]:
-        if not any(entry.name == "loopquant" for entry in entry_points(group="vllm.general_plugins")):
-            raise RuntimeError("Install requirements-vllm.txt, including its editable LoopQuant worker plugin")
-        if "VLLM_PLUGINS" in os.environ:
-            plugins = set(filter(None, os.environ["VLLM_PLUGINS"].split(",")))
-            os.environ["VLLM_PLUGINS"] = ",".join(sorted(plugins | {"loopquant"}))
-        register_vllm_models()
-    from .vllm_adapter import EvaluationVLLM
-    backend = EvaluationVLLM(allow_truncation=config["generative"]["allow_truncation"], **arguments)
+    with _vllm_subprocess_environment():
+        if metadata["fake_quantization"]:
+            if not any(entry.name == "loopquant" for entry in entry_points(group="vllm.general_plugins")):
+                raise RuntimeError("Install requirements-vllm.txt, including its editable LoopQuant worker plugin")
+            if "VLLM_PLUGINS" in os.environ:
+                plugins = set(filter(None, os.environ["VLLM_PLUGINS"].split(",")))
+                os.environ["VLLM_PLUGINS"] = ",".join(sorted(plugins | {"loopquant"}))
+            register_vllm_models()
+        from .vllm_adapter import EvaluationVLLM
+        backend = EvaluationVLLM(allow_truncation=config["generative"]["allow_truncation"], **arguments)
     # Harness reloads the original config separately from the engine. Reflect
     # the effective loop/architecture overrides in evaluation artifacts too.
     for key, value in arguments["hf_overrides"].items():

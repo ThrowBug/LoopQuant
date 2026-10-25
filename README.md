@@ -220,7 +220,11 @@ manifest/safetensors format is reused. No packed INT4 kernel is introduced.
 
 The integration is single-GPU, eager, with torch.compile, CUDA Graph and prefix caching disabled.
 The vLLM launcher uses `python -s` to keep packages in `~/.local` out of the
-runtime import path. Direct CLI examples use the same option.
+runtime import path. Direct CLI examples use the same option. vLLM's registry
+starts a separate Python interpreter without copying `-s`, so backend initialization
+also temporarily sets `PYTHONNOUSERSITE=1` for its child processes. The previous
+value is restored in the calling process when initialization finishes or fails;
+no shell export is needed.
 Engine seed, context budget, task batch sizes and truncation policy follow the
 evaluation protocol. vLLM always uses its KV cache, so `generative.use_cache: false`
 is rejected rather than silently ignored. `CUDA_VISIBLE_DEVICES` selects the GPU;

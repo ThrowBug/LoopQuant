@@ -6,6 +6,8 @@ Real vLLM tests are opt-in and require a compatible Linux GPU environment.
 
 import importlib
 import json
+import os
+import subprocess
 import sys
 from types import ModuleType, SimpleNamespace
 
@@ -95,7 +97,7 @@ def test_original_vllm_arguments_are_explicit(monkeypatch):
     assert args["pretrained"] == "ByteDance/Ouro-1.4B"
     assert args["hf_overrides"] == {"total_ut_steps": 2}
     assert args["enforce_eager"] and args["tensor_parallel_size"] == 1
-    assert args["compilation_config"] == {"level": 0}
+    assert args["compilation_config"] == {"mode": 0}
     assert args["max_num_seqs"] == 16 and args["enable_prefix_caching"] is False
     assert metadata["mode"] == "full_precision"
     with pytest.raises(ValueError, match="always uses"):
@@ -117,6 +119,47 @@ def test_backend_factory_preserves_effective_config(monkeypatch):
         "ByteDance/Ouro-1.4B", resolve_evaluation_config({}), num_loops=2, device="cpu")
     assert captured[0]["hf_overrides"] == {"total_ut_steps": 2}
     assert backend._config.total_ut_steps == metadata["num_loops"] == 2
+
+
+@pytest.mark.parametrize("previous", [None, "0", "1"])
+@pytest.mark.parametrize("snapshot", [False, True])
+@pytest.mark.parametrize("fail", [False, True])
+def test_backend_isolates_plain_python_children_and_restores_environment(monkeypatch, previous, snapshot, fail):
+    import loopquant.vllm_backend as loader
+    if previous is None:
+        monkeypatch.delenv("PYTHONNOUSERSITE", raising=False)
+    else:
+        monkeypatch.setenv("PYTHONNOUSERSITE", previous)
+    monkeypatch.setattr(loader, "check_vllm_environment", lambda device: None)
+    monkeypatch.setattr(loader, "build_vllm_arguments", lambda *a, **kw: (
+        {"hf_overrides": {"total_ut_steps": 2}}, {"fake_quantization": snapshot}))
+    monkeypatch.setattr(loader, "entry_points", lambda **kw: [SimpleNamespace(name="loopquant")])
+
+    def register():
+        assert os.environ["PYTHONNOUSERSITE"] == "1"
+    monkeypatch.setattr(loader, "register_vllm_models", register)
+
+    def construct(**kwargs):
+        # Reproduce the registry's plain `python -m ...` subprocess: no -s.
+        output = subprocess.check_output([sys.executable, "-c",
+            "import json, os, site, sys; print(json.dumps(["
+            "os.environ.get('PYTHONNOUSERSITE'), sys.flags.no_user_site, site.ENABLE_USER_SITE]))"],
+            text=True)
+        assert json.loads(output) == ["1", 1, False]
+        if fail:
+            raise RuntimeError("engine initialization failed")
+        return SimpleNamespace(_config=SimpleNamespace())
+
+    fake = ModuleType("loopquant.vllm_adapter")
+    fake.EvaluationVLLM = construct
+    monkeypatch.setitem(sys.modules, "loopquant.vllm_adapter", fake)
+    if fail:
+        with pytest.raises(RuntimeError, match="engine initialization failed"):
+            loader.load_vllm_backend("unused", resolve_evaluation_config({}), num_loops=2)
+    else:
+        backend, _ = loader.load_vllm_backend("unused", resolve_evaluation_config({}), num_loops=2)
+        assert backend._config.total_ut_steps == 2
+    assert os.environ.get("PYTHONNOUSERSITE") == previous
 
 
 def test_vllm_runner_uses_shared_task_protocol_and_records_backend(tmp_path, monkeypatch):
