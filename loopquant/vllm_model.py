@@ -1,26 +1,27 @@
-"""Single-GPU, eager vLLM bridge for existing LoopQuant Ouro snapshots.
+"""Single-GPU Ouro execution with native vLLM decoder control flow and KV cache.
 
-Keep the checkpoint's HF decoder/MLP/norm implementations and unfused projections.
-Only attention/cache execution is replaced. No weights are re-quantized or rotated.
-The module is imported lazily by vLLM workers, never on the default HF path.
+The HF skeleton is only the unchanged checkpoint tensor carrier. Inference uses
+static per-loop views of its weights, without Python quantization context state.
 """
 
 import inspect
-from types import MethodType
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModelForCausalLM
 from vllm.attention import Attention
+from vllm.compilation.decorators import support_torch_compile
+from vllm.model_executor.models.ouro import OuroDecoderLayer
 
 from .checkpoint import read_checkpoint_manifest, restore_checkpoint_tensors, _restore_structure
-from .lctc import ACTIVE_LCTC_RUNTIME, _LCTCRuntime
 from .quantization import QUANTIZATION_CONTEXT
+from .vllm_ops import EXECUTION_MODES, InferenceLinear, InferenceResidualNorm, TransformCache
 
 
 def rotary_query_key(query, key, cos, sin):
-    """Ouro's HF RoPE convention, retaining the saved rotary embedding state."""
+    """Retain the HF RoPE convention and the checkpoint's exact rotary state."""
     def rotate_half(value):
         first, second = value.chunk(2, dim=-1)
         return torch.cat((-second, first), dim=-1)
@@ -30,8 +31,7 @@ def rotary_query_key(query, key, cos, sin):
             key * cos + rotate_half(key) * sin)
 
 
-def attach_paged_attention(model, cache_config, *, prefix=""):
-    """Return registered vLLM attention layers; HF state_dict stays unchanged."""
+def build_paged_attention(model, cache_config, *, prefix=""):
     core, config = model.model, model.config
     if not hasattr(core, "rotary_emb"):
         raise ValueError("vLLM LoopQuant requires Ouro's rotary_emb decoder architecture")
@@ -42,42 +42,102 @@ def attach_paged_attention(model, cache_config, *, prefix=""):
         if "position_embeddings" not in inspect.signature(attention.forward).parameters:
             raise ValueError("unsupported Ouro attention signature for vLLM")
         head_dim = getattr(attention, "head_dim", config.hidden_size // config.num_attention_heads)
-        per_loop = []
         for loop in range(model._loopquant_num_loops):
-            per_loop.append(Attention(
+            layers.append(Attention(
                 config.num_attention_heads, head_dim, getattr(attention, "scaling", head_dim ** -0.5),
                 num_kv_heads=config.num_key_value_heads, cache_config=cache_config,
                 per_layer_sliding_window=getattr(attention, "sliding_window", None),
                 prefix=f"{prefix}model.layers.{loop * count + index}.self_attn.attn",
             ))
-        layers.extend(per_loop)
-
-        def make_forward(caches, heads, kv_heads, dimension):
-            def forward(module, hidden_states, position_embeddings, attention_mask=None,
-                        current_ut=0, **kwargs):
-                batch, length, _ = hidden_states.shape
-                if batch != 1:
-                    raise ValueError("vLLM bridge expects one flattened token stream")
-                query = module.q_proj(hidden_states).view(batch, length, heads, dimension).transpose(1, 2)
-                key = module.k_proj(hidden_states).view(batch, length, kv_heads, dimension).transpose(1, 2)
-                value = module.v_proj(hidden_states).reshape(length, kv_heads * dimension)
-                query, key = rotary_query_key(query, key, *position_embeddings)
-                output = caches[current_ut](
-                    query.transpose(1, 2).reshape(length, heads * dimension),
-                    key.transpose(1, 2).reshape(length, kv_heads * dimension), value,
-                )
-                return module.o_proj(output.reshape(1, length, heads * dimension)), None
-            return forward
-
-        attention.forward = MethodType(make_forward(
-            per_loop, config.num_attention_heads, config.num_key_value_heads, head_dim,
-        ), attention)
     return layers
 
 
-class LoopQuantOuroForCausalLM(nn.Module):
-    """vLLM model interface with exact saved fake-quantization operators."""
+class InferenceAttention(nn.Module):
+    def __init__(self, attention, config, paged_attention, bits, loop, cgb, fast):
+        super().__init__()
+        self.heads, self.kv_heads = config.num_attention_heads, config.num_key_value_heads
+        self.dim = getattr(attention, "head_dim", config.hidden_size // self.heads)
+        for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            setattr(self, name, InferenceLinear(getattr(attention, name), bits, loop, cgb, fast=fast))
+        self.attn = paged_attention
 
+    def forward(self, positions, hidden_states, current_ut):
+        # Native Ouro passes positions through unchanged; here it is the shared
+        # (cos, sin) pair computed once by the saved HF rotary module.
+        batch, length, _ = hidden_states.shape
+        query = self.q_proj(hidden_states).view(batch, length, self.heads, self.dim).transpose(1, 2)
+        key = self.k_proj(hidden_states).view(batch, length, self.kv_heads, self.dim).transpose(1, 2)
+        value = self.v_proj(hidden_states).reshape(length, self.kv_heads * self.dim)
+        query, key = rotary_query_key(query, key, *positions)
+        output = self.attn(
+            query.transpose(1, 2).reshape(length, self.heads * self.dim),
+            key.transpose(1, 2).reshape(length, self.kv_heads * self.dim), value,
+        )
+        return self.o_proj(output.reshape(1, length, self.heads * self.dim))
+
+
+class InferenceMLP(nn.Module):
+    def __init__(self, mlp, bits, loop, cgb, fast):
+        super().__init__()
+        for name in ("gate_proj", "up_proj", "down_proj"):
+            setattr(self, name, InferenceLinear(getattr(mlp, name), bits, loop, cgb, fast=fast))
+        self.act_fn = getattr(mlp, "act_fn", F.silu)
+
+    def forward(self, hidden):
+        return self.down_proj(self.act_fn(self.gate_proj(hidden)) * self.up_proj(hidden))
+
+
+class InferenceDecoder(OuroDecoderLayer):
+    """Reuse native Ouro forward, supplying independent LoopQuant projections."""
+
+    def __init__(self, decoder, config, paged_attention, bits, loop, cgb, fast):
+        # Do not allocate native fused QKV/gate-up weights: their inputs differ.
+        nn.Module.__init__(self)
+        self.self_attn = InferenceAttention(decoder.self_attn, config, paged_attention, bits, loop, cgb, fast)
+        self.mlp = InferenceMLP(decoder.mlp, bits, loop, cgb, fast)
+        for name in ("input_layernorm", "input_layernorm_2",
+                     "post_attention_layernorm", "post_attention_layernorm_2"):
+            setattr(self, name, InferenceResidualNorm(getattr(decoder, name)))
+
+
+@support_torch_compile(dynamic_arg_dims={"input_ids": 0, "positions": -1, "inputs_embeds": 0})
+class InferenceOuroModel(nn.Module):
+    def __init__(self, *, vllm_config, core, config, attentions, allocation, cgb, mode):
+        super().__init__()
+        self.embed_tokens, self.rotary_emb = core.embed_tokens, core.rotary_emb
+        self.norm = InferenceResidualNorm(core.norm)
+        self.loops = nn.ModuleList([
+            nn.ModuleList([
+                InferenceDecoder(layer, config, attentions[index * len(allocation) + loop],
+                                 bits, loop, cgb, mode == "fast")
+                for index, layer in enumerate(core.layers)
+            ]) for loop, bits in enumerate(allocation)
+        ])
+        self.prepared = False
+
+    def prepare(self):
+        cache = TransformCache()
+        with torch.no_grad():
+            for module in self.modules():
+                if isinstance(module, InferenceLinear):
+                    module.prepare(cache)
+        self.prepared = True
+
+    def forward(self, input_ids: torch.Tensor, positions: torch.Tensor,
+                intermediate_tensors=None, inputs_embeds: torch.Tensor | None = None):
+        if not self.prepared:
+            raise RuntimeError("checkpoint tensors have not been prepared for inference")
+        hidden = (self.embed_tokens(input_ids) if inputs_embeds is None else inputs_embeds).unsqueeze(0)
+        position_embeddings = self.rotary_emb(hidden, positions.unsqueeze(0))
+        for loop, layers in enumerate(self.loops):
+            residual = None
+            for layer in layers:
+                hidden, residual = layer(position_embeddings, hidden, loop, residual)
+            hidden, _ = self.norm(hidden, residual)
+        return hidden.squeeze(0)
+
+
+class LoopQuantOuroForCausalLM(nn.Module):
     def __init__(self, *, vllm_config, prefix=""):
         super().__init__()
         parallel = vllm_config.parallel_config
@@ -85,65 +145,58 @@ class LoopQuantOuroForCausalLM(nn.Module):
             raise ValueError("LoopQuant vLLM currently supports one GPU only")
         if vllm_config.quant_config is not None:
             raise ValueError("LoopQuant snapshots already contain fake-quantized weights")
-        source = vllm_config.model_config.model
-        self.directory = source
-        self.manifest = read_checkpoint_manifest(source)
-        self.device = vllm_config.device_config.device
-        self.dtype = vllm_config.model_config.dtype
+        self.directory = vllm_config.model_config.model
+        self.manifest = read_checkpoint_manifest(self.directory)
+        self.device, self.dtype = vllm_config.device_config.device, vllm_config.model_config.dtype
         self.num_loops = int(self.manifest["num_loops"])
-        config = AutoConfig.from_pretrained(source, trust_remote_code=True, local_files_only=True)
+        config = AutoConfig.from_pretrained(self.directory, trust_remote_code=True, local_files_only=True)
         if config.model_type != "ouro" or config.total_ut_steps != self.num_loops:
             raise ValueError("checkpoint config and Ouro loop count must match")
         self.config = config
-        QUANTIZATION_CONTEXT.configure(self.num_loops, self.manifest["allocation"])
-        with init_empty_weights(include_buffers=False):
-            self.hf_model = AutoModelForCausalLM.from_config(
-                config, trust_remote_code=True, attn_implementation="eager",
-            )
-            _restore_structure(self.hf_model, self.manifest)
+        engine_config = getattr(vllm_config.model_config, "hf_config", config)
+        self.execution_mode = getattr(engine_config, "loopquant_execution", "cached")
+        if self.execution_mode not in EXECUTION_MODES:
+            raise ValueError(f"unknown LoopQuant execution mode: {self.execution_mode}")
+        previous = vars(QUANTIZATION_CONTEXT).copy()
+        try:
+            QUANTIZATION_CONTEXT.configure(self.num_loops, self.manifest["allocation"])
+            with init_empty_weights(include_buffers=False):
+                self.hf_model = AutoModelForCausalLM.from_config(
+                    config, trust_remote_code=True, attn_implementation="eager")
+                _restore_structure(self.hf_model, self.manifest)
+        finally:
+            vars(QUANTIZATION_CONTEXT).update(previous)
         self.hf_model._loopquant_num_loops = self.num_loops
-        self.attentions = attach_paged_attention(
-            self.hf_model, vllm_config.cache_config, prefix=f"{prefix}." if prefix else "",
-        )
-        self.runtime = (_LCTCRuntime(self.hf_model.lctc_cgb, self.manifest["lctc_enabled"])
-                        if self.manifest["has_lctc"] else None)
+        self.attentions = build_paged_attention(
+            self.hf_model, vllm_config.cache_config, prefix=f"{prefix}." if prefix else "")
+        cgb = (self.hf_model.lctc_cgb
+               if self.manifest["has_lctc"] and self.manifest["lctc_enabled"] else None)
+        self.model = InferenceOuroModel(
+            vllm_config=vllm_config, core=self.hf_model.model, config=config,
+            attentions=self.attentions, allocation=self.manifest["allocation"],
+            cgb=cgb, mode=self.execution_mode)
 
     def load_weights(self, weights):
-        # Use the verified manifest/index, not vLLM's standard HF name mapping.
-        # The supplied iterator is lazy and is intentionally not consumed.
+        # Restore into the original HF structure. Execution views reference its
+        # modules, so assign=True cannot leave stale/meta weight references.
         restore_checkpoint_tensors(self.hf_model, self.directory, self.manifest, device=self.device)
         if self.hf_model.model.embed_tokens.weight.dtype != self.dtype:
             raise ValueError("vLLM dtype must match the saved checkpoint embedding dtype")
+        if self.execution_mode != "cached" and any(
+            word in getattr(self.hf_model.model.rotary_emb, "rope_type", "default")
+            for word in ("dynamic", "longrope")
+        ):
+            raise ValueError("dynamic RoPE requires LoopQuant cached execution")
+        self.model.prepare()
         return {name for name, _ in self.named_parameters()}
 
     def embed_input_ids(self, input_ids):
-        return self.hf_model.model.embed_tokens(input_ids)
+        return self.model.embed_tokens(input_ids)
 
     def forward(self, input_ids, positions, intermediate_tensors=None, inputs_embeds=None):
         if intermediate_tensors is not None:
-            raise ValueError("pipeline parallelism is unsupported by the LoopQuant bridge")
-        core = self.hf_model.model
-        hidden = (self.embed_input_ids(input_ids) if inputs_embeds is None else inputs_embeds).unsqueeze(0)
-        position_ids = positions.unsqueeze(0)
-        position_embeddings = core.rotary_emb(hidden, position_ids)
-        previous = (QUANTIZATION_CONTEXT.num_loops, QUANTIZATION_CONTEXT.current_loop,
-                    QUANTIZATION_CONTEXT.activation_bits, QUANTIZATION_CONTEXT.enabled)
-        QUANTIZATION_CONTEXT.configure(self.num_loops, self.manifest["allocation"])
-        QUANTIZATION_CONTEXT.enabled = True
-        token = ACTIVE_LCTC_RUNTIME.set(self.runtime)
-        try:
-            for loop in range(self.num_loops):
-                QUANTIZATION_CONTEXT.current_loop = loop
-                for layer in core.layers:
-                    hidden = layer(hidden, attention_mask=None, position_ids=position_ids,
-                                   past_key_value=None, use_cache=False, cache_position=positions,
-                                   position_embeddings=position_embeddings, current_ut=loop)
-                hidden = core.norm(hidden)
-        finally:
-            ACTIVE_LCTC_RUNTIME.reset(token)
-            (QUANTIZATION_CONTEXT.num_loops, QUANTIZATION_CONTEXT.current_loop,
-             QUANTIZATION_CONTEXT.activation_bits, QUANTIZATION_CONTEXT.enabled) = previous
-        return hidden.squeeze(0)
+            raise ValueError("pipeline parallelism is unsupported by LoopQuant")
+        return self.model(input_ids, positions, intermediate_tensors, inputs_embeds)
 
     def compute_logits(self, hidden_states):
         return self.hf_model.lm_head(hidden_states).float()

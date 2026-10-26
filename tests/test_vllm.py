@@ -268,11 +268,35 @@ class ReferenceAttention(torch.nn.Module):
         return result.transpose(0, 1).reshape(-1, self.heads * self.dim)
 
 
+class NativeDecoderControlFlow(torch.nn.Module):
+    """vLLM 0.11.2 OuroDecoderLayer.forward, for the CPU-only import stub.
+
+    Real native modules and graph execution are exercised by test_vllm_gpu.py.
+    """
+
+    def forward(self, positions, hidden_states, current_ut, residual=None):
+        if residual is None:
+            residual = hidden_states
+            hidden_states = self.input_layernorm(hidden_states)
+        else:
+            hidden_states, residual = self.input_layernorm(hidden_states, residual)
+        hidden_states = self.self_attn(
+            positions=positions, hidden_states=hidden_states, current_ut=current_ut)
+        hidden_states = self.input_layernorm_2(hidden_states)
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.post_attention_layernorm_2(hidden_states)
+        return hidden_states, residual
+
+
 @pytest.fixture
 def bridge_module(monkeypatch):
-    for name in ("vllm", "vllm.attention"):
+    for name in ("vllm", "vllm.attention", "vllm.compilation", "vllm.compilation.decorators",
+                 "vllm.model_executor", "vllm.model_executor.models", "vllm.model_executor.models.ouro"):
         monkeypatch.setitem(sys.modules, name, ModuleType(name))
     sys.modules["vllm.attention"].Attention = ReferenceAttention
+    sys.modules["vllm.compilation.decorators"].support_torch_compile = lambda **kw: lambda cls: cls
+    sys.modules["vllm.model_executor.models.ouro"].OuroDecoderLayer = NativeDecoderControlFlow
     # Undo the imported bridge as well, so fake vLLM does not leak to other tests.
     monkeypatch.delitem(sys.modules, "loopquant.vllm_model", raising=False)
     module = importlib.import_module("loopquant.vllm_model")
@@ -287,6 +311,10 @@ def bridge_module(monkeypatch):
 def save_paged_model(path, allocation, *, num_layers=1):
     torch.manual_seed(27)
     model = PagedOuroForCausalLM(PagedOuroConfig(num_hidden_layers=num_layers)).to(torch.bfloat16).eval()
+    with torch.no_grad():
+        for module in model.modules():
+            if "RMSNorm" in type(module).__name__:
+                module.weight.copy_(torch.linspace(0.8, 1.2, module.weight.numel()))
     configure_looped_model(model, 4)
     QUANTIZATION_CONTEXT.configure(4, allocation)
     rotate_ouro_backbone(model)
@@ -321,7 +349,12 @@ def test_bridge_restores_prefill_and_incremental_decode(tmp_path, bridge_module,
     bridge.load_weights(iter(()))
     for name, tensor in original.state_dict().items():
         assert torch.equal(tensor, bridge.hf_model.state_dict()[name]), name
-    assert bridge.runtime.cgb.entry("model.layers.0.self_attn.q_proj", 0).clip.dtype == torch.float32
+    plan = bridge.model.loops[0][0].self_attn.q_proj
+    assert plan.clip.dtype == torch.float32
+    assert plan.linear.weight is bridge.hf_model.model.layers[0].self_attn.q_proj.weight
+    other = bridge.model.loops[1][0].self_attn.q_proj
+    assert other.linear.weight is plan.linear.weight
+    assert other.transform.hadamard is plan.transform.hadamard
     assert {cache.prefix for cache in bridge.attentions} == {
         f"model.layers.{index}.self_attn.attn" for index in range(4 * num_layers)}
     ids = torch.tensor([[3, 4, 3]])
@@ -361,3 +394,41 @@ def test_bridge_rejects_dtype_override_and_restores_quantization_context(tmp_pat
         bridge(torch.tensor([3]), torch.tensor([0]))
     assert (QUANTIZATION_CONTEXT.num_loops, QUANTIZATION_CONTEXT.current_loop,
             QUANTIZATION_CONTEXT.activation_bits, QUANTIZATION_CONTEXT.enabled) == (2, 1, (8, 16), False)
+
+
+@pytest.mark.parametrize("mode", ["cached", "compiled", "fast"])
+def test_snapshot_execution_mode_is_forwarded_to_worker(tmp_path, monkeypatch, mode):
+    save_paged_model(tmp_path / "loopquant", (8, 4, 8, 4))
+    monkeypatch.setenv("LOOPQUANT_VLLM_EXECUTION", mode)
+    arguments, metadata = build_vllm_arguments(
+        tmp_path / "loopquant", resolve_evaluation_config({}), num_loops=4)
+    assert arguments["hf_overrides"]["loopquant_execution"] == mode
+    assert metadata["execution_mode"] == mode
+    assert arguments["enforce_eager"] == (mode == "cached")
+    assert arguments["compilation_config"]["mode"] == (0 if mode == "cached" else 3)
+    monkeypatch.setenv("LOOPQUANT_VLLM_EXECUTION", "typo")
+    with pytest.raises(ValueError, match="LOOPQUANT_VLLM_EXECUTION"):
+        build_vllm_arguments(tmp_path / "loopquant", resolve_evaluation_config({}), num_loops=4)
+
+
+@pytest.mark.parametrize("compiled", [False, True])
+def test_static_executor_never_calls_context_quantized_forward(tmp_path, bridge_module, monkeypatch, compiled):
+    from loopquant.quantization import QuantizedLinear
+
+    original = save_paged_model(tmp_path / "loopquant", (8, 4, 8, 4), num_layers=2)
+    with torch.no_grad():
+        expected = original(torch.tensor([[3, 4, 3]])).logits[0].float()
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
+        quant_config=None, model_config=SimpleNamespace(model=str(tmp_path / "loopquant"), dtype=torch.bfloat16),
+        cache_config=None, device_config=SimpleNamespace(device="cpu"))
+    bridge = bridge_module.LoopQuantOuroForCausalLM(vllm_config=config)
+    bridge.load_weights(iter(()))
+    if compiled:
+        bridge.model = torch.compile(bridge.model, backend="eager", fullgraph=True, dynamic=True)
+    monkeypatch.setattr(QuantizedLinear, "forward", lambda *a, **kw: pytest.fail("context-based forward"))
+    QUANTIZATION_CONTEXT.configure(1, (16,))
+    QUANTIZATION_CONTEXT.enabled = False
+    with torch.no_grad(), torch._dynamo.config.patch(enable_cpp_symbolic_shape_guards=False):
+        actual = bridge.compute_logits(bridge(torch.tensor([3, 4, 3]), torch.arange(3)))
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -212,13 +212,49 @@ task list or few-shot settings in `evaluation_generative.yaml`. To run only the
 zero-shot suite, omit `--generative` in the direct CLI command; MBPP execution
 permission is then unnecessary. The loop count must match a saved snapshot.
 
-The snapshot bridge reconstructs the saved HF decoder, CLDC transforms and LCTC
-tables, preserving unfused projections and exact tensor dtypes (including FP32
-CGB parameters). Only attention execution is replaced by vLLM paged attention;
-each physical layer and recurrent loop has its own cache entry. The existing
-manifest/safetensors format is reused. No packed INT4 kernel is introduced.
+The snapshot executor restores the existing manifest/safetensors without
+re-quantizing weights. It reuses vLLM's native Ouro decoder control flow and paged
+attention, with separate KV entries for each physical layer and recurrent loop.
+Q/K/V and gate/up keep their independent CLDC transforms, activation quantizers
+and LCTC parameters. Static per-loop execution views share the restored weights;
+FP32 CGB tables and the original rotated RMSNorm dtype boundaries are retained.
+Residual addition is rounded before normalization, as on the HF path. No packed
+INT4 kernel is introduced, and quantization/HF evaluation code is unchanged.
 
-The integration is single-GPU, eager, with torch.compile, CUDA Graph and prefix caching disabled.
+Saved snapshots use `LOOPQUANT_VLLM_EXECUTION=cached` by default. It caches fixed
+Hadamard/small orthogonal matrices on the device, sharing them across projections,
+and pre-expands LCTC gain/bias after loading. Forward calls neither rebuild these
+constants nor read the global quantization context. Matrix caches are per engine,
+consume additional resident VRAM, and do not enter the checkpoint.
+
+One optional environment setting selects more aggressive execution:
+
+| Value | Snapshot execution |
+| --- | --- |
+| `cached` (default) | Reference arithmetic in eager mode; compile and CUDA Graph disabled. |
+| `compiled` | Same operators, vLLM piecewise `torch.compile` and CUDA Graph enabled. |
+| `fast` | Compiled execution plus Triton fast Hadamard, fused permutation/activation fake quantization, and LCTC output affine. |
+
+`compiled` and `fast` are experimental and must pass the GPU checks below in the
+target environment. They retain the mathematical transforms but can change
+floating-point reduction/rounding and quantization decisions. Dynamic/LongRoPE
+snapshots require `cached`. Original HF models retain their previous eager
+settings and ignore this snapshot-specific variable. All modes remain single-GPU
+with prefix caching disabled. The resolved mode is recorded in evaluation metadata.
+
+```bash
+# Existing commands automatically use cached execution for saved snapshots.
+conda activate loopquant-vllm && \
+  USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/eval.sh outputs/ouro_1.4b_w4a4/loopquant 4
+
+# Experimental fast path; validate before using its benchmark scores.
+conda activate loopquant-vllm && \
+  LOOPQUANT_VLLM_EXECUTION=fast USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
+  LOOPQUANT_EVAL_OUTPUT_DIR=outputs/ouro_1.4b_w4a4_vllm_fast_eval \
+  bash scripts/eval.sh outputs/ouro_1.4b_w4a4/loopquant 4
+```
+
 The vLLM launcher uses `python -s` to keep packages in `~/.local` out of the
 runtime import path. Direct CLI examples use the same option. vLLM's registry
 starts a separate Python interpreter without copying `-s`, so backend initialization
@@ -237,7 +273,8 @@ versions and per-request generation receipts are saved. Preflight and model-load
 failures also produce a failed manifest.
 
 CPU reference tests cover tensor restoration, RoPE, recurrent prefill and
-incremental decode with W4A4/mixed A4/A8 and LCTC. They do **not** exercise the real
+incremental decode with W4A4/mixed A4/A8 and non-neutral LCTC/Norm parameters,
+shared matrix caches, and a context-free tensor graph. They do **not** exercise the real
 CUDA paged-attention implementation. Run the optional integration smoke test in
 the target vLLM environment before relying on benchmark results; actual Ouro
 GPU accuracy/performance remains an acceptance check, not a claim of these tests.
@@ -251,6 +288,18 @@ LOOPQUANT_VLLM_TEST_MODEL=/path/to/loopquant \
 # comparison loads another model copy on the GPU and checks numerical agreement.
 LOOPQUANT_VLLM_TEST_MODEL=ByteDance/Ouro-1.4B LOOPQUANT_VLLM_COMPARE_HF=1 \
   python -s -m pytest tests/test_vllm_gpu.py -q
+
+# Repeat snapshot checks in each mode; includes standalone Triton operator checks.
+LOOPQUANT_VLLM_EXECUTION=fast LOOPQUANT_VLLM_TEST_MODEL=/path/to/loopquant \
+  LOOPQUANT_VLLM_COMPARE_HF=1 python -s -m pytest tests/test_vllm_gpu.py -q
+
+# Warmup is excluded. Record engine TTFT/decode timing when available, plus
+# same-process reference/cached/fast operator times and extra peak allocations.
+# Run in separate processes for cached, compiled and fast with identical settings.
+LOOPQUANT_VLLM_EXECUTION=cached LOOPQUANT_VLLM_TEST_MODEL=/path/to/loopquant \
+  LOOPQUANT_VLLM_BENCHMARK=1 \
+  LOOPQUANT_VLLM_BENCHMARK_OUTPUT=outputs/vllm_cached_benchmark.json \
+  python -s -m pytest tests/test_vllm_gpu.py -q -s
 ```
 
 ## Checkpoint format

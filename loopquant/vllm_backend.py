@@ -82,16 +82,22 @@ def build_vllm_arguments(source, config, *, num_loops, dtype=None):
             dtype = {"BF16": "bfloat16", "F16": "float16", "F32": "float32"}[
                 tensors.get_slice(name).get_dtype()]
         overrides["architectures"] = [MODEL_ARCHITECTURE]
+        execution = os.environ.get("LOOPQUANT_VLLM_EXECUTION", "cached")
+        if execution not in {"cached", "compiled", "fast"}:
+            raise ValueError("LOOPQUANT_VLLM_EXECUTION must be cached, compiled or fast")
+        overrides["loopquant_execution"] = execution
+    compiled = snapshot and overrides["loopquant_execution"] != "cached"
     arguments = {
         "pretrained": source, "dtype": dtype or "bfloat16", "trust_remote_code": True,
         "tensor_parallel_size": 1, "data_parallel_size": 1,
         "max_model_len": generation["max_length"], "batch_size": config["batch_size"],
         "max_num_seqs": max(config["batch_size"], generation["batch_size"]),
         "gpu_memory_utilization": 0.8, "seed": config["seed"],
-        "hf_overrides": overrides, "enforce_eager": True,
-        # Eager execution also excludes torch.compile: Python loop state and
-        # LCTC's ContextVar must be read on every forward, not captured once.
-        "compilation_config": {"mode": 0},
+        "hf_overrides": overrides, "enforce_eager": not compiled,
+        # Only the static checkpoint executor supports compilation. Experimental
+        # modes are explicit; original HF models keep their existing settings.
+        "compilation_config": ({"mode": 3, "cudagraph_mode": "PIECEWISE"}
+                               if compiled else {"mode": 0}),
         "enable_prefix_caching": False,
         # Weight dtype does not describe FP32 CGB tables, so never run a second
         # model-wide cast or online quantizer after restoring our saved tensors.
@@ -102,6 +108,7 @@ def build_vllm_arguments(source, config, *, num_loops, dtype=None):
                 "engine_arguments": arguments, "vllm_version": VLLM_VERSION}
     if manifest is not None:
         metadata["allocation"] = manifest["allocation"]
+        metadata["execution_mode"] = overrides["loopquant_execution"]
     return arguments, metadata
 
 
