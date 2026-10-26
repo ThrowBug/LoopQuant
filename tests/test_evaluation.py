@@ -62,6 +62,71 @@ def test_generative_requires_task_selection():
     assert evaluation.preflight_evaluation({}, suites=["wikitext2"]) is None
 
 
+def test_drop_renders_real_reference_in_one_shot_prompt(monkeypatch):
+    import datasets
+
+    def document(question, number="", spans=None, date=None):
+        return {
+            "query_id": question, "passage": "The passage.", "question": question,
+            "answer": {"number": number, "spans": spans or [],
+                       "date": date or {"day": "", "month": "", "year": ""},
+                       "worker_id": "", "hit_id": ""},
+            "validated_answers": {"number": [], "spans": [], "date": []},
+        }
+
+    data = datasets.DatasetDict({
+        "train": datasets.Dataset.from_list([
+            document("How many people per 12 square miles?", number="1320"),
+            document("How many inhabitants per 12 square miles?", number="1320"),
+        ]),
+        "validation": datasets.Dataset.from_list([
+            document("How many field goals?", number="3"),
+            document("Who scored?", spans=["Chaz Schilens", "Johnnie Lee Higgins"]),
+            document("On what date?", date={"day": "3", "month": "October", "year": "2026"}),
+        ]),
+    })
+    monkeypatch.setattr(datasets, "load_dataset", lambda *args, **kwargs: data)
+    config = {"generative": {"tasks": [
+        {"name": "drop", "num_fewshot": 1, "max_gen_toks": 128},
+    ]}}
+    manager = evaluation.preflight_evaluation(config, suites=["generative"])
+    task = evaluation._load_tasks(manager, ["drop"])["drop"]
+    docs = list(task.validation_docs())
+    assert [task.doc_to_target(doc) for doc in docs] == [
+        "3", "Chaz Schilens, Johnnie Lee Higgins", "3 October 2026",
+    ]
+    task.set_fewshot_seed(0)
+    prompt = task.fewshot_context(docs[0], num_fewshot=1)
+    assert "12 square miles?1320" in prompt
+    assert prompt.endswith("How many field goals?")
+    assert "number,date,spans,worker_id,hit_id" not in prompt
+    assert task.process_results(docs[0], ["3"]) == {"em": 1.0, "f1": 1.0}
+    assert task.get_config("generation_kwargs")["until"] == ["."]
+
+
+@pytest.mark.parametrize("backend_name", ["hf", "vllm"])
+def test_drop_target_override_reaches_both_backends(tmp_path, monkeypatch, backend_name):
+    import lm_eval.evaluator
+    import loopquant.harness_adapter
+
+    calls = []
+    adapter = SimpleNamespace(generation_receipts=[], batch_size_per_gpu=1, batch_size=1)
+    monkeypatch.setattr(loopquant.harness_adapter, "EvaluationHFLM", lambda **kwargs: adapter)
+    monkeypatch.setattr(lm_eval.evaluator, "simple_evaluate", lambda **kwargs:
+                        calls.append(kwargs) or {"results": {"drop": {"em": 1.0, "f1": 1.0}}})
+    config = {"generative": {"tasks": [
+        {"name": "drop", "num_fewshot": 1, "max_gen_toks": 128},
+    ]}}
+    evaluation.run_evaluation(
+        SimpleNamespace(config=SimpleNamespace(), eval=lambda: None), SimpleNamespace(),
+        config, tmp_path, suites=["generative"], task_manager=object(), device="cpu",
+        lm_backend=adapter if backend_name == "vllm" else None, backend_name=backend_name,
+    )
+    assert calls[0]["tasks"][0]["task"] == "drop"
+    assert calls[0]["tasks"][0]["doc_to_target"] == "{{ answers[0] | join(', ') }}"
+    assert calls[0]["num_fewshot"] == 1
+
+
 def test_runner_forwards_protocol_and_preserves_partial_results(tmp_path, monkeypatch):
     import lm_eval.evaluator
     import loopquant.harness_adapter

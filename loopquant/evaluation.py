@@ -38,7 +38,26 @@ def _task_leaves(tasks):
             yield name, task
 
 
+def _task_specs(names):
+    """Keep the bundled DROP protocol, but render a parsed reference answer."""
+    if "drop" not in names:
+        return names
+    from lm_eval import tasks as harness_tasks
+
+    path = Path(harness_tasks.__file__).parent / "drop" / "default.yaml"
+    if hasattr(harness_tasks.TaskManager, "load"):
+        from lm_eval.tasks._yaml_loader import load_yaml
+        drop = load_yaml(path, resolve_func=True)
+    else:
+        from lm_eval.utils import load_yaml_config
+        drop = load_yaml_config(str(path))
+    # Raw `answer` is a dict; joining it emits field names in few-shot examples.
+    drop["doc_to_target"] = "{{ answers[0] | join(', ') }}"
+    return [dict(drop) if name == "drop" else name for name in names]
+
+
 def _load_tasks(manager, names):
+    names = _task_specs(names)
     if hasattr(manager, "load"):
         return manager.load(names)["tasks"]
     return dict(_task_leaves(manager.load_task_or_group(names)))
@@ -172,7 +191,7 @@ def run_evaluation(model, tokenizer, config, output_dir, *, suites, device="cuda
                     adapter.batch_size_per_gpu = batch_size
                 adapter.generation_receipts.clear()
                 result = evaluator.simple_evaluate(
-                    model=adapter, tasks=tasks, task_manager=task_manager,
+                    model=adapter, tasks=_task_specs(tasks), task_manager=task_manager,
                     num_fewshot=shots, batch_size=batch_size, device=device,
                     limit=config["limit"], random_seed=seed, numpy_random_seed=seed,
                     torch_random_seed=seed, fewshot_random_seed=generation["fewshot_seed"],
