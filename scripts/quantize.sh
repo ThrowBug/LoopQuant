@@ -14,7 +14,7 @@ load_run_config "$1" "${2:-${LOOPQUANT_EVAL_CONFIG:-${ROOT}/configs/evaluation_g
 mkdir -p "${output_dir}"
 echo "[LoopQuant] START config=${config} model=${model_path}" | tee -a "${output_dir}/launcher.log"
 set +e
-"${PYTHON}" -m loopquant.cli quantize \
+"${PYTHON}" -s -m loopquant.cli quantize \
   --model "${model_path}" \
   --config "${config}" \
   --output-dir "${output_dir}" \

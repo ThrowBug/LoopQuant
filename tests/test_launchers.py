@@ -72,7 +72,7 @@ def test_shell_launchers(tmp_path, model_source):
         )
         assert completed.returncode == 0, completed.stderr
         args = json.loads(capture.read_text())
-        prefix = (["-s"] if name == "eval" else []) + ["-m", "loopquant.cli", command]
+        prefix = ["-s", "-m", "loopquant.cli", command]
         assert args[:len(prefix)] == prefix
         assert args[args.index("--eval-config") + 1].replace("\\", "/").endswith("evaluation protocol.yaml")
         assert all(flag in args for flag in ("--wikitext2", "--c4", "--zero-shot"))
