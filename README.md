@@ -20,7 +20,7 @@ metric scripts are downloaded on first use.
 
 ## Two commands
 
-- `quantize`: load original weights, run CLDC -> ILPA -> LCTC, optionally save,
+- `quantize`: load original weights, run the configured algorithm, optionally save,
   then optionally evaluate the in-memory result.
 - `evaluate`: load original HF weights **or a saved LoopQuant checkpoint**, then
   evaluate. It never recalibrates or calls the quantization pipeline.
@@ -427,6 +427,101 @@ across checkpoint restoration in a fresh process, W4A4/mixed W4A6 allocation,
 FP32 CGB tensors, corruption detection, all four save/evaluate combinations,
 real HF/harness generation, and shell argument/exit handling. Full Ouro GPU
 benchmarks and Linux MBPP execution must still be validated in the target setup.
+
+## Low-rank compensation
+
+Select `algorithm: low_rank` using the new `configs/ouro_*_low_rank.yaml` files.
+Existing YAMLs default to the original CLDC -> ILPA -> LCTC algorithm. The shell
+command is unchanged:
+
+```bash
+conda activate loopquant && \
+  CUDA_VISIBLE_DEVICES=0 bash scripts/quantize.sh configs/ouro_1.4b_w4a4_low_rank.yaml
+
+conda activate loopquant && \
+  CUDA_VISIBLE_DEVICES=0 bash scripts/quantize.sh configs/ouro_1.4b_w4a8_low_rank.yaml
+
+conda activate loopquant && \
+  USE_VLLM=0 CUDA_VISIBLE_DEVICES=0 \
+  LOOPQUANT_EVAL_OUTPUT_DIR=outputs/ouro_1.4b_w4a4_low_rank_hf_eval \
+  bash scripts/eval.sh outputs/ouro_1.4b_w4a4_low_rank/loopquant 4
+
+conda activate loopquant-vllm && \
+  USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
+  LOOPQUANT_EVAL_OUTPUT_DIR=outputs/ouro_1.4b_w4a4_low_rank_vllm_eval \
+  bash scripts/eval.sh outputs/ouro_1.4b_w4a4_low_rank/loopquant 4
+```
+
+The evaluator's loop argument must match the saved `num_loops`; four is only the
+example configuration. Low-rank vLLM currently uses `cached` execution; the
+original LoopQuant `compiled`/`fast` modes are not enabled for this new method.
+No dependency changes or low-bit kernels are required for this path.
+
+Each of the seven attention/MLP projections contains one fixed GPTQ W4/G32 base
+plus rank-k increments. `method.rank_step` is k and `num_loops` is T.
+`method.sharing: prefix` activates cumulative ranks k, 2k, ..., Tk;
+`independent` activates a separate rank-k pair in each loop. Both store
+Tk(m+n) low-rank parameters for a matrix of shape (m,n), with equal factor dtype.
+The prefix version performs (T+1)/2 times as much low-rank branch work across all
+loops; equal storage does not imply equal compute. Embeddings, LM head, norms
+and biases retain their original floating precision and are frozen.
+
+Initialization and reconstruction are separate:
+
+1. Cache the original FP teacher trajectories and original projection weights.
+2. Initialize each shared base once with GPTQ. `method.gptq.hessian_mode` selects
+   `mean_hessian` (average per-loop input Grams) or `mean_activation` (Gram of
+   aligned mean inputs). This stage uses FP teacher inputs.
+3. Fit fixed per-module/per-loop activation clipping on teacher activations using
+   MSE over the configured grid. Quantization is dynamic symmetric G32, with
+   integer range [-7,7] for A4 or [-127,127] for A8. Both base and correction consume the same
+   dequantized activation; the correction is not requantized.
+4. Train loop 1 through T, visiting every decoder block in order. Only the current
+   rank-k increments inside that block are trainable. Initialize from a truncated
+   SVD of the remaining weight error, then use normalized block-output MSE against
+   the cached FP teacher. Student inputs come from completed student computations.
+   Freeze the increment, update student outputs, and apply the original final
+   norm at every loop boundary. There is no base-weight alternating update or
+   end-to-end fine-tuning. Activation rounding uses an STE inside the current block.
+
+`method.optimization` controls steps **per block per loop**, learning rate, batch
+size and gradient clipping. Its initial defaults (32 steps, 1e-3, batch size 4)
+are starting settings, not validated Ouro hyperparameters. All calibration tokens
+are eligible for fitting; `statistics_tokens_per_loop: null` uses all tokens for
+Hessian/clip statistics. A positive cap takes the same deterministic token prefix
+in each loop and changes the statistics cache key. Activation precision is uniform
+across all projections and loops: `w4a4` uses A4 and `w4a8` uses A8. Low-rank
+configurations do not accept per-loop bit plans and never run ILPA.
+`rotation.enabled` and `channel_scaling.enabled` are reserved and must remain false.
+
+The default `calibration.cache_dir` is `cache/calibration`, relative to the working
+directory (the launchers enter the repository). The layout is:
+
+```text
+cache/calibration/
+  tokens/                                      # tokenizer-keyed calibration IDs
+  <model_key>/<teacher_key>/
+    manifest.json
+    tokens.safetensors
+    teacher/block_000/weights.safetensors
+    teacher/block_000/loop_00/shard_00000.safetensors
+    hessian/<mean_hessian|mean_activation>/<statistics_key>/block_000.safetensors
+    activation_clip/<clip_key>/block_000.safetensors
+```
+
+Teacher keys include original weights, actual token IDs, tokenizer, source code,
+model configuration, loop count and precision. They do not include ranks,
+sharing or optimization settings. Derived statistics have their own keys and
+checksums. Teacher inputs/outputs retain their dtype and are streamed to disk;
+full trajectories can require substantial disk space. Temporary student states
+are removed after training. Neither training caches nor the original weights are
+needed to load a finished checkpoint.
+
+Snapshots still go to `output_dir/loopquant` before evaluation. Their manifest
+identifies `low-rank-fake-quantized` format version 1, factor layout and loop plan;
+HF and vLLM dispatch to the correct restorer automatically. The saved weights
+are floating fake-quantized tensors, not packed INT4. Use distinct `output_dir`
+values for sharing/Hessian ablations. Existing LoopQuant snapshots remain valid.
 
 ## License
 

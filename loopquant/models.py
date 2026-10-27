@@ -104,6 +104,7 @@ def load_looped_transformer(
     device: str = "cuda:0",
     dtype: torch.dtype = torch.bfloat16,
     configure_context: bool = True,
+    algorithm: str = "loopquant",
 ):
     """Load a local/HF Ouro model; teachers must not reset student context."""
     path = Path(model_path).expanduser()
@@ -127,15 +128,15 @@ def load_looped_transformer(
         low_cpu_mem_usage=True,
     )
     model.to(device).eval()
-    configure_looped_model(model, num_loops)
+    configure_looped_model(model, num_loops, quantization_hooks=algorithm == "loopquant")
     model._loopquant_model_path = source
-    if configure_context:
+    if configure_context and algorithm == "loopquant":
         QUANTIZATION_CONTEXT.configure(int(num_loops))
         QUANTIZATION_CONTEXT.enabled = False
     return model, tokenizer
 
 
-def configure_looped_model(model, num_loops: int) -> None:
+def configure_looped_model(model, num_loops: int, *, quantization_hooks=True) -> None:
     """Attach Ouro execution wrappers without rotating weights or changing bits."""
     if int(num_loops) <= 0:
         raise ValueError("num_loops must be positive")
@@ -161,7 +162,8 @@ def configure_looped_model(model, num_loops: int) -> None:
     model.forward = forced_forward
     model._loopquant_forced_forward = True
     model._loopquant_num_loops = int(num_loops)
-    register_loop_hooks(model, "ouro")
+    if quantization_hooks:
+        register_loop_hooks(model, "ouro")
 
 
 def load_model_for_evaluation(source, *, num_loops: int, device="cuda:0", dtype=None):
@@ -174,6 +176,7 @@ def load_model_for_evaluation(source, *, num_loops: int, device="cuda:0", dtype=
             raise ValueError("quantized checkpoints preserve their saved dtype; omit dtype overrides")
         model, tokenizer = load_quantized_checkpoint(path, device=device, num_loops=num_loops)
         return model, tokenizer, {"mode": "quantized", "model_source": str(path),
+                                  "algorithm": getattr(model, "_quantization_algorithm", "loopquant"),
                                   "fake_quantization": True,
                                   "allocation": list(model._loopquant_allocation)}
     model, tokenizer = load_looped_transformer(

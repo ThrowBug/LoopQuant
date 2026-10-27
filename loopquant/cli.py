@@ -21,7 +21,7 @@ def _add_quantize_arguments(parser):
     parser.add_argument("--save", action="store_true", help="Save output-dir/loopquant before evaluation")
     parser.add_argument("--model-family", choices=("ouro", "nanbeige", "huginn"))
     parser.add_argument("--weight-bits", type=int)
-    parser.add_argument("--activation-setting", choices=("w4a4", "w4a6"))
+    parser.add_argument("--activation-setting", choices=("w4a4", "w4a6", "w4a8"))
     parser.add_argument("--group-size", type=int)
     parser.add_argument("--num-calibration-samples", type=int)
     parser.add_argument("--calibration-seqlen", type=int)
@@ -68,7 +68,7 @@ def _evaluation_suites(args):
 
 def _run_quantize(args):
     from .checkpoint import save_quantized_checkpoint
-    from .pipeline import LoopQuantPipeline
+    from .methods import run_quantization
 
     started = time.time()
     config = LoopQuantConfig.from_yaml(args.config)
@@ -91,19 +91,23 @@ def _run_quantize(args):
     if device.startswith("cuda"):
         torch.cuda.reset_peak_memory_stats()
     write_yaml(output / "config.yaml", config.to_dict())
+    loading_options = {"algorithm": "low_rank"} if config.algorithm == "low_rank" else {}
     model, tokenizer = load_looped_transformer(
         args.model, model_family=config.model_family, device=device, num_loops=config.num_loops,
+        **loading_options,
     )
+    data_options = ({"cache_dir": Path(config.calibration["cache_dir"]) / "tokens"}
+                    if config.algorithm == "low_rank" else {})
     data = load_calibration_data(
         tokenizer, dataset=config.calibration["dataset"], split=config.calibration["split"],
         num_samples=config.calibration["num_samples"], sequence_length=config.calibration["sequence_length"],
         seed=config.calibration["seed"],
+        **data_options,
     )
     if tuple(data.shape) != (config.calibration["num_samples"], config.calibration["sequence_length"]):
         raise RuntimeError(f"unexpected calibration shape {tuple(data.shape)}")
-    result = LoopQuantPipeline(config, device=device, logger=logger).run(model, tokenizer, data)
-    for name, value in (("cldc_summary", result.cldc), ("ilpa_allocation", result.ilpa),
-                        ("lctc_summary", result.lctc)):
+    result = run_quantization(config, model, tokenizer, data, device=device, logger=logger)
+    for name, value in result.stage_summaries.items():
         write_json(output / f"{name}.json", value)
     summary = {
         "model": str(args.model), "model_family": config.model_family,
@@ -111,8 +115,8 @@ def _run_quantize(args):
         "weight_bits": config.quantization["weight_bits"],
         "weight_group_size": config.quantization["group_size"],
         "activation_setting": config.quantization["activation_setting"],
-        "activation_allocation": result.allocation, "fake_quantization": True,
-        "calibration": config.calibration, "stage_order": list(result.stage_order),
+        "calibration": config.calibration,
+        **result.summary,
         "runtime": runtime_metadata(started), "checkpoint": None,
     }
     write_json(output / "quantization_summary.json", summary)

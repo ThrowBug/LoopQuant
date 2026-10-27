@@ -14,6 +14,7 @@ from .checkpoint import MANIFEST_NAME, read_checkpoint_manifest
 
 VLLM_VERSION = "0.11.2"
 MODEL_ARCHITECTURE = "LoopQuantOuroForCausalLM"
+LOW_RANK_ARCHITECTURE = "LowRankOuroForCausalLM"
 
 
 @contextmanager
@@ -41,6 +42,7 @@ def register_vllm_models():
     """vLLM general-plugin entry point, also run in spawned worker processes."""
     from vllm import ModelRegistry
     ModelRegistry.register_model(MODEL_ARCHITECTURE, "loopquant.vllm_model:LoopQuantOuroForCausalLM")
+    ModelRegistry.register_model(LOW_RANK_ARCHITECTURE, "loopquant.low_rank.vllm_model:LowRankOuroForCausalLM")
 
 
 def check_vllm_environment(device):
@@ -81,10 +83,13 @@ def build_vllm_arguments(source, config, *, num_loops, dtype=None):
         with safe_open(path / manifest["weight_map"][name], framework="pt") as tensors:
             dtype = {"BF16": "bfloat16", "F16": "float16", "F32": "float32"}[
                 tensors.get_slice(name).get_dtype()]
-        overrides["architectures"] = [MODEL_ARCHITECTURE]
+        low_rank = manifest["format"] == "low-rank-fake-quantized"
+        overrides["architectures"] = [LOW_RANK_ARCHITECTURE if low_rank else MODEL_ARCHITECTURE]
         execution = os.environ.get("LOOPQUANT_VLLM_EXECUTION", "cached")
         if execution not in {"cached", "compiled", "fast"}:
             raise ValueError("LOOPQUANT_VLLM_EXECUTION must be cached, compiled or fast")
+        if low_rank and execution != "cached":
+            raise ValueError("low_rank currently supports cached vLLM execution only")
         overrides["loopquant_execution"] = execution
     compiled = snapshot and overrides["loopquant_execution"] != "cached"
     arguments = {
@@ -107,6 +112,7 @@ def build_vllm_arguments(source, config, *, num_loops, dtype=None):
                 "model_source": source, "num_loops": num_loops, "fake_quantization": snapshot,
                 "engine_arguments": arguments, "vllm_version": VLLM_VERSION}
     if manifest is not None:
+        metadata["algorithm"] = "low_rank" if manifest["format"] == "low-rank-fake-quantized" else "loopquant"
         metadata["allocation"] = manifest["allocation"]
         metadata["execution_mode"] = overrides["loopquant_execution"]
     return arguments, metadata

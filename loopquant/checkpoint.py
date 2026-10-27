@@ -75,6 +75,10 @@ def _write_weights(state, directory, max_shard_bytes):
 def save_quantized_checkpoint(model, tokenizer, path, *, quantization_config=None,
                               max_shard_bytes=1_000_000_000):
     """Publish a complete snapshot atomically. Never overwrite an existing path."""
+    if getattr(model, "_quantization_algorithm", "loopquant") == "low_rank":
+        from .low_rank.checkpoint import save_checkpoint
+        return save_checkpoint(model, tokenizer, path, quantization_config=quantization_config,
+                               max_shard_bytes=max_shard_bytes)
     target = Path(path).expanduser().resolve()
     if target.exists():
         raise FileExistsError(f"checkpoint already exists: {target}")
@@ -138,6 +142,35 @@ def save_quantized_checkpoint(model, tokenizer, path, *, quantization_config=Non
     }
     if manifest["has_rotation"]:
         state["__loopquant_rotation"] = model._loopquant_rotation
+    return _publish_checkpoint(model, tokenizer, target, state, manifest, max_shard_bytes)
+
+
+def _runtime_state(model):
+    """Capture non-persistent runtime state shared by both checkpoint formats."""
+    state, runtime_tensors, rope_scalars = dict(model.state_dict()), [], []
+    for name, module in model.named_modules():
+        extra = {key: value for key, value in module._buffers.items()
+                 if key in module._non_persistent_buffers_set and value is not None}
+        extra.update({key: value for key, value in vars(module).items() if isinstance(value, torch.Tensor)})
+        for attribute, tensor in extra.items():
+            key = f"__runtime_tensor_{len(runtime_tensors)}"
+            runtime_tensors.append({"key": key, "module": name, "attribute": attribute})
+            state[key] = tensor
+        for attribute in ("max_seq_len_cached", "original_max_seq_len", "attention_scaling"):
+            value = getattr(module, attribute, None)
+            if isinstance(value, (int, float, bool)):
+                rope_scalars.append({"module": name, "attribute": attribute, "value": value})
+    aliases, seen = {}, {}
+    for name, parameter in model.named_parameters(remove_duplicate=False):
+        if id(parameter) in seen:
+            aliases[name] = seen[id(parameter)]
+        else:
+            seen[id(parameter)] = name
+    return state, {"runtime_tensors": runtime_tensors, "rope_scalars": rope_scalars,
+                   "parameter_aliases": aliases}
+
+
+def _publish_checkpoint(model, tokenizer, target, state, manifest, max_shard_bytes):
     target.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f".{target.name}-", dir=target.parent) as temporary:
         directory = Path(temporary)
@@ -185,7 +218,7 @@ def read_checkpoint_manifest(path, *, num_loops=None):
     """Validate a snapshot before either HF or vLLM constructs its modules."""
     directory = Path(path).expanduser().resolve()
     manifest = json.loads(_local_file(directory, MANIFEST_NAME).read_text(encoding="utf-8"))
-    if manifest.get("format") != FORMAT or manifest.get("format_version") != FORMAT_VERSION:
+    if manifest.get("format") not in {FORMAT, "low-rank-fake-quantized"} or manifest.get("format_version") != FORMAT_VERSION:
         raise ValueError("unsupported LoopQuant checkpoint format/version")
     if num_loops is not None and num_loops != manifest["num_loops"]:
         raise ValueError(f"num_loops={num_loops} conflicts with saved num_loops={manifest['num_loops']}")
@@ -240,6 +273,9 @@ def load_quantized_checkpoint(path, *, device="cuda:0", num_loops=None):
 
     directory = Path(path).expanduser().resolve()
     manifest = read_checkpoint_manifest(directory, num_loops=num_loops)
+    if manifest["format"] == "low-rank-fake-quantized":
+        from .low_rank.checkpoint import load_checkpoint
+        return load_checkpoint(directory, manifest, device=device)
     config = AutoConfig.from_pretrained(directory, trust_remote_code=True, local_files_only=True)
     if config.model_type != "ouro":
         raise ValueError("checkpoint format v1 supports Ouro only")

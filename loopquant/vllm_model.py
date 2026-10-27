@@ -53,12 +53,12 @@ def build_paged_attention(model, cache_config, *, prefix=""):
 
 
 class InferenceAttention(nn.Module):
-    def __init__(self, attention, config, paged_attention, bits, loop, cgb, fast):
+    def __init__(self, attention, config, paged_attention, bits, loop, cgb, fast, linear_factory=None):
         super().__init__()
         self.heads, self.kv_heads = config.num_attention_heads, config.num_key_value_heads
         self.dim = getattr(attention, "head_dim", config.hidden_size // self.heads)
         for name in ("q_proj", "k_proj", "v_proj", "o_proj"):
-            setattr(self, name, InferenceLinear(getattr(attention, name), bits, loop, cgb, fast=fast))
+            setattr(self, name, (linear_factory or InferenceLinear)(getattr(attention, name), bits, loop, cgb, fast=fast))
         self.attn = paged_attention
 
     def forward(self, positions, hidden_states, current_ut):
@@ -77,10 +77,10 @@ class InferenceAttention(nn.Module):
 
 
 class InferenceMLP(nn.Module):
-    def __init__(self, mlp, bits, loop, cgb, fast):
+    def __init__(self, mlp, bits, loop, cgb, fast, linear_factory=None):
         super().__init__()
         for name in ("gate_proj", "up_proj", "down_proj"):
-            setattr(self, name, InferenceLinear(getattr(mlp, name), bits, loop, cgb, fast=fast))
+            setattr(self, name, (linear_factory or InferenceLinear)(getattr(mlp, name), bits, loop, cgb, fast=fast))
         self.act_fn = getattr(mlp, "act_fn", F.silu)
 
     def forward(self, hidden):
@@ -90,11 +90,11 @@ class InferenceMLP(nn.Module):
 class InferenceDecoder(OuroDecoderLayer):
     """Reuse native Ouro forward, supplying independent LoopQuant projections."""
 
-    def __init__(self, decoder, config, paged_attention, bits, loop, cgb, fast):
+    def __init__(self, decoder, config, paged_attention, bits, loop, cgb, fast, linear_factory=None):
         # Do not allocate native fused QKV/gate-up weights: their inputs differ.
         nn.Module.__init__(self)
-        self.self_attn = InferenceAttention(decoder.self_attn, config, paged_attention, bits, loop, cgb, fast)
-        self.mlp = InferenceMLP(decoder.mlp, bits, loop, cgb, fast)
+        self.self_attn = InferenceAttention(decoder.self_attn, config, paged_attention, bits, loop, cgb, fast, linear_factory)
+        self.mlp = InferenceMLP(decoder.mlp, bits, loop, cgb, fast, linear_factory)
         for name in ("input_layernorm", "input_layernorm_2",
                      "post_attention_layernorm", "post_attention_layernorm_2"):
             setattr(self, name, InferenceResidualNorm(getattr(decoder, name)))
@@ -102,14 +102,14 @@ class InferenceDecoder(OuroDecoderLayer):
 
 @support_torch_compile(dynamic_arg_dims={"input_ids": 0, "positions": -1, "inputs_embeds": 0})
 class InferenceOuroModel(nn.Module):
-    def __init__(self, *, vllm_config, core, config, attentions, allocation, cgb, mode):
+    def __init__(self, *, vllm_config, core, config, attentions, allocation, cgb, mode, linear_factory=None):
         super().__init__()
         self.embed_tokens, self.rotary_emb = core.embed_tokens, core.rotary_emb
         self.norm = InferenceResidualNorm(core.norm)
         self.loops = nn.ModuleList([
             nn.ModuleList([
                 InferenceDecoder(layer, config, attentions[index * len(allocation) + loop],
-                                 bits, loop, cgb, mode == "fast")
+                                 bits, loop, cgb, mode == "fast", linear_factory)
                 for index, layer in enumerate(core.layers)
             ]) for loop, bits in enumerate(allocation)
         ])
@@ -121,6 +121,8 @@ class InferenceOuroModel(nn.Module):
             for module in self.modules():
                 if isinstance(module, InferenceLinear):
                     module.prepare(cache)
+                elif hasattr(module, "prepare_for_inference"):
+                    module.prepare_for_inference()
         self.prepared = True
 
     def forward(self, input_ids: torch.Tensor, positions: torch.Tensor,
