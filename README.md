@@ -494,6 +494,16 @@ across all projections and loops: `w4a4` uses A4 and `w4a8` uses A8. Low-rank
 configurations do not accept per-loop bit plans and never run ILPA.
 `rotation.enabled` and `channel_scaling.enabled` are reserved and must remain false.
 
+`calibration.batch_size` controls FP teacher collection independently of
+`method.optimization.batch_size`; its default is 4. Collection batches equal-length
+sequences, retains the original per-sample cache layout, and overlaps bounded
+background disk writes/checksums with forward execution. GPU-to-CPU snapshots
+remain synchronous. On Ouro, only the final token's unused vocabulary logits are
+computed; all decoder token states are still collected. Progress logs distinguish
+weight fingerprinting, original-weight writes, forward batches and completed writes.
+Changing collection batch size can change floating-point rounding and therefore
+uses a separate teacher key. Set it to 1 to reuse an existing single-sample cache.
+
 The default `calibration.cache_dir` is `cache/calibration`, relative to the working
 directory (the launchers enter the repository). The layout is:
 

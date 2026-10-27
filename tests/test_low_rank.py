@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -190,6 +191,93 @@ def test_teacher_cache_invalidates_changed_tokens_and_weights(tmp_path):
         model.model.embed_tokens.weight.add_(0.01)
     changed_weight = prepare_teacher_cache(model, tokenizer, DATA, config, "cpu", logging.getLogger())
     assert changed_weight.directory != original.directory
+
+
+def test_teacher_collection_batches_samples_and_writes_immutable_states_off_thread(tmp_path, monkeypatch):
+    import loopquant.low_rank.cache as caching
+    model, tokenizer = tiny(loops=3)
+    config = configuration(tmp_path, loops=3)
+    config.calibration["batch_size"] = 2
+    data = torch.tensor([[3, 4, 3], [4, 3, 4], [3, 3, 4], [4, 4, 3], [4, 3, 3]])
+    inputs, outputs, batches, writers = {}, {}, [], []
+    handles = [model.register_forward_pre_hook(
+        lambda module, args, kwargs: batches.append(len(kwargs["input_ids"])), with_kwargs=True)]
+    for index, block in enumerate(model.model.layers):
+        def pre_hook(module, args, kwargs, block_id=index):
+            inputs.setdefault((block_id, kwargs["current_ut"]), []).append(args[0].clone())
+
+        def post_hook(module, args, kwargs, output, block_id=index):
+            outputs.setdefault((block_id, kwargs["current_ut"]), []).append(output.clone())
+
+        handles.extend((block.register_forward_pre_hook(pre_hook, with_kwargs=True),
+                        block.register_forward_hook(post_hook, with_kwargs=True)))
+    original_save = caching.save_file
+
+    def record_writer(tensors, path):
+        if Path(path).parent.name.startswith("loop_"):
+            writers.append(threading.get_ident())
+        return original_save(tensors, path)
+
+    monkeypatch.setattr(caching, "save_file", record_writer)
+    try:
+        teacher = prepare_teacher_cache(model, tokenizer, data, config, "cpu", logging.getLogger())
+    finally:
+        for handle in handles:
+            handle.remove()
+    assert batches == [2, 2, 1]
+    assert writers and set(writers).isdisjoint({threading.get_ident()})
+    assert teacher.manifest["collection_batch_size"] == 2
+    for key in inputs:
+        expected_input, expected_output = torch.cat(inputs[key]), torch.cat(outputs[key])
+        for sample in range(len(data)):
+            states = teacher.read(*key, sample)
+            torch.testing.assert_close(states["input"], expected_input[sample:sample + 1], rtol=0, atol=0)
+            torch.testing.assert_close(states["output"], expected_output[sample:sample + 1], rtol=0, atol=0)
+
+
+def test_teacher_collection_batch_size_separates_caches(tmp_path):
+    model, tokenizer = tiny(layers=1)
+    config = configuration(tmp_path)
+    config.calibration["batch_size"] = 1
+    single = prepare_teacher_cache(model, tokenizer, DATA, config, "cpu", logging.getLogger())
+    assert "collection_batch_size" not in single.manifest["identity"]
+    config.calibration["batch_size"] = 2
+    batched = prepare_teacher_cache(model, tokenizer, DATA, config, "cpu", logging.getLogger())
+    assert single.directory != batched.directory
+    assert batched.manifest["identity"]["collection_batch_size"] == 2
+    config.calibration["batch_size"] = 1
+    assert prepare_teacher_cache(model, tokenizer, DATA, config, "cpu", logging.getLogger()).hit
+
+
+def test_teacher_writer_failure_propagates_and_cleans_up(tmp_path, monkeypatch):
+    import loopquant.low_rank.cache as caching
+    model, tokenizer = tiny(layers=1)
+    config = configuration(tmp_path)
+    original_save = caching.save_file
+
+    def broken_save(tensors, path):
+        if Path(path).parent.name.startswith("loop_"):
+            raise OSError("teacher write failed")
+        return original_save(tensors, path)
+
+    monkeypatch.setattr(caching, "save_file", broken_save)
+    with pytest.raises(OSError, match="teacher write failed"):
+        prepare_teacher_cache(model, tokenizer, DATA, config, "cpu", logging.getLogger())
+    assert not list(Path(config.calibration["cache_dir"]).rglob("manifest.json"))
+    assert not list(Path(config.calibration["cache_dir"]).rglob(".teacher-*"))
+    assert all(not block._forward_pre_hooks and not block._forward_hooks for block in model.model.layers)
+    monkeypatch.setattr(caching, "save_file", original_save)
+    teacher = prepare_teacher_cache(model, tokenizer, DATA, config, "cpu", logging.getLogger())
+    assert not teacher.hit
+    assert teacher.read(0, 0, 0)["input"].shape == (1, 3, 32)
+
+
+@pytest.mark.parametrize("batch_size", [0, False, 1.5])
+def test_teacher_collection_requires_positive_integer_batch_size(tmp_path, batch_size):
+    values = configuration(tmp_path).to_dict()
+    values["calibration"]["batch_size"] = batch_size
+    with pytest.raises(ValueError, match="calibration.batch_size"):
+        LoopQuantConfig.from_dict(values)
 
 
 @pytest.mark.parametrize("sharing,mode", [("prefix", "mean_hessian"), ("independent", "mean_activation")])

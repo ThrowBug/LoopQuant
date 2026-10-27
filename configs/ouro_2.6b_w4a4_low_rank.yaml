@@ -5,7 +5,7 @@ model_key: ouro_2.6b
 model_path: models/Ouro-2.6B
 num_loops: 4
 quantization: {weight_bits: 4, group_size: 32, activation_setting: w4a4}
-calibration: {dataset: wikitext2, split: train, num_samples: 128, sequence_length: 2048, seed: 0, cache_dir: cache/calibration}
+calibration: {dataset: wikitext2, split: train, num_samples: 128, sequence_length: 2048, seed: 0, batch_size: 4, cache_dir: cache/calibration}
 method:
   sharing: prefix
   rank_step: 16

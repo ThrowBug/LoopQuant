@@ -111,6 +111,7 @@ class LoopQuantConfig:
         if values.get("algorithm", "loopquant") == "low_rank":
             defaults["method"] = LOW_RANK_DEFAULTS
             defaults["calibration"]["cache_dir"] = "cache/calibration"
+            defaults["calibration"]["batch_size"] = 4
             for name in ("activation_candidates", "average_activation_bits"):
                 defaults["quantization"].pop(name)
         merged = _merge(defaults, {key: value for key, value in values.items() if key != "num_loops"})
@@ -216,6 +217,8 @@ class LoopQuantConfig:
         cache_dir = self.calibration["cache_dir"]
         if not isinstance(cache_dir, str) or not cache_dir.strip():
             raise ValueError("calibration.cache_dir must be a nonempty directory path")
+        if not _positive_integer(self.calibration["batch_size"]):
+            raise ValueError("calibration.batch_size must be a positive integer")
 
     def apply_overrides(self, **values: Any) -> None:
         for key, value in values.items():
