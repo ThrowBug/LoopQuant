@@ -65,7 +65,7 @@ LOW_RANK_DEFAULTS = {
     "gptq": {"hessian_mode": "mean_hessian", "damp_percent": 0.01,
              "block_size": 128, "statistics_tokens_per_loop": None},
     "activation": {"clip_min": 0.5, "clip_max": 1.0, "clip_step": 0.01},
-    "optimization": {"steps": 32, "learning_rate": 1e-3, "batch_size": 4,
+    "optimization": {"enabled": True, "steps": 32, "learning_rate": 1e-3, "batch_size": 4,
                      "gradient_clip": 1.0, "svd_iterations": 3},
     "rotation": {"enabled": False},
     "channel_scaling": {"enabled": False},
@@ -210,10 +210,15 @@ class LoopQuantConfig:
         if not 0 < act["clip_min"] <= act["clip_max"] <= 1 or act["clip_step"] <= 0:
             raise ValueError("activation clip grid must lie in (0, 1]")
         options = method["optimization"]
-        if any(not _positive_integer(options[key]) for key in ("steps", "batch_size", "svd_iterations")):
-            raise ValueError("optimization steps, batch_size and svd_iterations must be positive")
-        if options["learning_rate"] <= 0 or options["gradient_clip"] <= 0:
-            raise ValueError("optimization learning_rate and gradient_clip must be positive")
+        if not isinstance(options["enabled"], bool):
+            raise ValueError("optimization.enabled must be a boolean")
+        if not _positive_integer(options["svd_iterations"]):
+            raise ValueError("optimization.svd_iterations must be positive")
+        if options["enabled"]:
+            if any(not _positive_integer(options[key]) for key in ("steps", "batch_size")):
+                raise ValueError("optimization steps and batch_size must be positive")
+            if options["learning_rate"] <= 0 or options["gradient_clip"] <= 0:
+                raise ValueError("optimization learning_rate and gradient_clip must be positive")
         cache_dir = self.calibration["cache_dir"]
         if not isinstance(cache_dir, str) or not cache_dir.strip():
             raise ValueError("calibration.cache_dir must be a nonempty directory path")

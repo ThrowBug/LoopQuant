@@ -28,14 +28,14 @@ from test_evaluation import tiny_model_and_tokenizer
 from test_vllm import bridge_module
 
 
-def configuration(tmp_path, *, loops=2, sharing="prefix", mode="mean_hessian", setting="w4a4"):
+def configuration(tmp_path, *, loops=2, sharing="prefix", mode="mean_hessian", setting="w4a4", optimize=True):
     return LoopQuantConfig.from_dict({
         "algorithm": "low_rank", "num_loops": loops, "model_key": "tiny",
         "quantization": {"activation_setting": setting},
         "calibration": {"cache_dir": str(tmp_path / "cache"), "num_samples": 2, "sequence_length": 3},
         "method": {"sharing": sharing, "rank_step": 2, "gptq": {"hessian_mode": mode},
                    "activation": {"clip_min": 0.8, "clip_max": 1.0, "clip_step": 0.1},
-                   "optimization": {"steps": 3, "learning_rate": 0.01}},
+                   "optimization": {"enabled": optimize, "steps": 3, "learning_rate": 0.01}},
     })
 
 
@@ -80,6 +80,33 @@ def test_invalid_method_options_are_rejected(tmp_path, update):
         else:
             values["method"][key] = value
     with pytest.raises(ValueError):
+        LoopQuantConfig.from_dict(values)
+
+
+def test_old_configs_default_to_enabled_optimization(tmp_path):
+    values = configuration(tmp_path).to_dict()
+    values["method"]["optimization"].pop("enabled")
+    config = LoopQuantConfig.from_dict(values)
+    assert config.method["optimization"]["enabled"] is True
+    assert config.method["optimization"]["steps"] == 3
+    values["method"]["optimization"] = {"enabled": False}
+    assert LoopQuantConfig.from_dict(values).method["optimization"]["enabled"] is False
+
+
+@pytest.mark.parametrize("value", ["false", 0, None])
+def test_optimization_switch_requires_a_boolean(tmp_path, value):
+    values = configuration(tmp_path).to_dict()
+    values["method"]["optimization"]["enabled"] = value
+    with pytest.raises(ValueError, match="optimization.enabled"):
+        LoopQuantConfig.from_dict(values)
+
+
+def test_disabled_optimization_ignores_training_options_but_validates_svd(tmp_path):
+    values = configuration(tmp_path, optimize=False).to_dict()
+    values["method"]["optimization"].update(steps=0, learning_rate=0, batch_size=0, gradient_clip=0)
+    assert LoopQuantConfig.from_dict(values).method["optimization"]["enabled"] is False
+    values["method"]["optimization"]["svd_iterations"] = 0
+    with pytest.raises(ValueError, match="svd_iterations"):
         LoopQuantConfig.from_dict(values)
 
 
@@ -177,6 +204,9 @@ def test_teacher_cache_and_hessian_modes_match_independent_formulas(tmp_path, mo
     assert clip_bits and set(clip_bits) == {8}
     assert all(torch.equal(h2[name], h8[name]) for name in h2)
     assert len(list((teacher.directory / "activation_clip").glob("*/block_000.safetensors"))) == 2
+    config.method["optimization"]["enabled"] = False
+    disabled = prepare_teacher_cache(model, tokenizer, DATA, config, "cpu", logging.getLogger())
+    assert disabled.hit and disabled.directory == teacher.directory
     monkeypatch.setattr(caching, "run_block", lambda *a, **kw: pytest.fail("statistics cache was not reused"))
     block_statistics(model, 0, teacher, config, "cpu")
 
@@ -282,12 +312,14 @@ def test_teacher_collection_requires_positive_integer_batch_size(tmp_path, batch
 
 @pytest.mark.parametrize("sharing,mode", [("prefix", "mean_hessian"), ("independent", "mean_activation")])
 @pytest.mark.parametrize("setting,bits", [("w4a4", 4), ("w4a8", 8)])
-def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, sharing, mode, setting, bits):
+@pytest.mark.parametrize("optimize", [True, False])
+def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, sharing, mode, setting, bits, optimize):
     model, tokenizer = tiny()
-    config = configuration(tmp_path, sharing=sharing, mode=mode, setting=setting)
+    config = configuration(tmp_path, sharing=sharing, mode=mode, setting=setting, optimize=optimize)
     frozen = {name: parameter.detach().clone() for name, parameter in model.named_parameters()
               if parameter.ndim == 1 or name.startswith(("model.embed_tokens", "lm_head"))}
     result = LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
+    assert result.summary["optimization_enabled"] is optimize
     assert result.summary["activation_allocation"] == [bits, bits]
     assert result.summary["rank_schedule"] == ([2, 4] if sharing == "prefix" else [2, 2])
     assert not any(p.requires_grad for p in result.model.parameters())
@@ -298,7 +330,15 @@ def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, sharing, m
         tokens = model.generate(DATA[:1], max_new_tokens=2, do_sample=False, use_cache=False)
     checkpoint = tmp_path / "loopquant"
     save_quantized_checkpoint(model, tokenizer, checkpoint, quantization_config=config.to_dict(), max_shard_bytes=15000)
+    manifest_path = checkpoint / "checkpoint_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["quantization_config"]["method"]["optimization"]["enabled"] is optimize
+    if optimize:
+        # Older snapshots omitted the switch; restore their exact saved tensors.
+        manifest["quantization_config"]["method"]["optimization"].pop("enabled")
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     restored, _ = load_quantized_checkpoint(checkpoint, device="cpu", num_loops=2)
+    assert restored._low_rank_config["method"]["optimization"]["enabled"] is optimize
     assert restored._loopquant_allocation == (bits, bits)
     assert all(module.activation_bits == bits for block in restored.model.layers for _, module in iter_linears(block))
     assert all(torch.equal(value, restored.state_dict()[name]) for name, value in model.state_dict().items())
@@ -325,13 +365,14 @@ def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, sharing, m
 
 @pytest.mark.parametrize("sharing", ["prefix", "independent"])
 @pytest.mark.parametrize("setting,bits", [("w4a4", 4), ("w4a8", 8)])
-def test_low_rank_vllm_prefill_decode_and_method_dispatch(tmp_path, bridge_module, monkeypatch, sharing, setting, bits):
+@pytest.mark.parametrize("optimize", [True, False])
+def test_low_rank_vllm_prefill_decode_and_method_dispatch(tmp_path, bridge_module, monkeypatch, sharing, setting, bits, optimize):
     import loopquant.vllm_backend as backend
     from loopquant.evaluation_config import resolve_evaluation_config
     monkeypatch.delitem(sys.modules, "loopquant.low_rank.vllm_model", raising=False)
     bridge_class = importlib.import_module("loopquant.low_rank.vllm_model").LowRankOuroForCausalLM
     torch.manual_seed(89)
-    config = configuration(tmp_path, loops=3, sharing=sharing, setting=setting)
+    config = configuration(tmp_path, loops=3, sharing=sharing, setting=setting, optimize=optimize)
     model = PagedOuroForCausalLM(PagedOuroConfig(num_hidden_layers=2, total_ut_steps=3)).to(torch.bfloat16).eval()
     configure_looped_model(model, 3, quantization_hooks=False)
     wrap_linears(model, config)
@@ -370,10 +411,11 @@ def test_low_rank_vllm_prefill_decode_and_method_dispatch(tmp_path, bridge_modul
         backend.build_vllm_arguments(snapshot, resolve_evaluation_config({}), num_loops=3)
 
 
-def test_reconstruction_states_match_final_full_model_at_every_loop(tmp_path, monkeypatch):
+@pytest.mark.parametrize("optimize", [True, False])
+def test_reconstruction_states_match_final_full_model_at_every_loop(tmp_path, monkeypatch, optimize):
     import loopquant.low_rank.reconstruction as training
     model, tokenizer = tiny(loops=3)
-    config = configuration(tmp_path, loops=3)
+    config = configuration(tmp_path, loops=3, optimize=optimize)
     captured = {}
     original = training.run_block
 
@@ -399,6 +441,52 @@ def test_reconstruction_states_match_final_full_model_at_every_loop(tmp_path, mo
     finally:
         for handle in handles:
             handle.remove()
+
+
+@pytest.mark.parametrize("sharing", ["prefix", "independent"])
+@pytest.mark.parametrize("setting", ["w4a4", "w4a8"])
+def test_initialization_only_never_optimizes_and_preserves_every_increment(tmp_path, monkeypatch, sharing, setting):
+    import loopquant.low_rank.reconstruction as training
+    model, tokenizer = tiny(loops=3)
+    config = configuration(tmp_path, loops=3, sharing=sharing, setting=setting, optimize=False)
+    initialized, bases, refreshes = {}, {}, []
+    original_initialize, original_run = training.initialize_increment, training.run_block
+
+    def initialize(module, original, loop, **kwargs):
+        original_initialize(module, original, loop, **kwargs)
+        assert not module.A[loop].requires_grad and not module.B[loop].requires_grad
+        initialized[id(module), loop] = [bank[loop].detach().to(module.weight.dtype).clone()
+                                         for bank in (module.A, module.B)]
+        bases[id(module)] = module.weight.detach().clone()
+
+    def refresh(model, block, hidden, loop):
+        assert not torch.is_grad_enabled()
+        assert not any(parameter.requires_grad for parameter in block.parameters())
+        refreshes.append(loop)
+        return original_run(model, block, hidden, loop)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("initialization-only mode must not construct an optimizer or run backward")
+
+    monkeypatch.setattr(training, "initialize_increment", initialize)
+    monkeypatch.setattr(training, "run_block", refresh)
+    monkeypatch.setattr(torch.optim, "Adam", forbidden)
+    monkeypatch.setattr(torch.Tensor, "backward", forbidden)
+    result = LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
+    assert result.summary["optimization_enabled"] is False
+    assert result.summary["stage_order"][-1] == "incremental_block_initialization"
+    assert len(refreshes) == config.num_loops * len(model.model.layers) * len(DATA)
+    assert not any(parameter.requires_grad for parameter in model.parameters())
+    for block in model.model.layers:
+        for _, module in iter_linears(block):
+            assert torch.equal(module.weight, bases[id(module)])
+            for loop in range(config.num_loops):
+                assert all(torch.equal(bank[loop], expected) for bank, expected in
+                           zip((module.A, module.B), initialized[id(module), loop]))
+    records = result.stage_summaries["low_rank_reconstruction"]["blocks"]
+    assert len(records) == config.num_loops * len(model.model.layers)
+    assert all(record["steps"] == 0 and record["optimization_enabled"] is False
+               and record["initial_loss"] is None and record["final_loss"] is None for record in records)
 
 
 def test_token_cache_tracks_tokenizer_behavior_and_detects_corruption(tmp_path, monkeypatch):

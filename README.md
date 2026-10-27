@@ -486,8 +486,26 @@ Initialization and reconstruction are separate:
 
 `method.optimization` controls steps **per block per loop**, learning rate, batch
 size and gradient clipping. Its initial defaults (32 steps, 1e-3, batch size 4)
-are starting settings, not validated Ouro hyperparameters. All calibration tokens
-are eligible for fitting; `statistics_tokens_per_loop: null` uses all tokens for
+are starting settings, not validated Ouro hyperparameters. Set
+`method.optimization.enabled: false` for initialization only: each rank-k increment
+is initialized by the same residual SVD, frozen in the base dtype, and used to
+refresh student states in the original loop/block order. No optimizer or backward
+pass runs. Both `prefix` and `independent` support this mode. Training-only options
+are ignored, while `svd_iterations` still controls initialization. Run summaries
+report zero optimization steps and null losses for this mode.
+
+The switch defaults to true when absent, preserving old YAML and checkpoint
+loading behavior. It does not change teacher/Hessian/clip cache keys, checkpoint
+format, inference structure or shell commands. For example, keep the remaining
+optimization options and change only:
+
+```yaml
+method:
+  optimization:
+    enabled: false
+```
+
+All calibration tokens are eligible for fitting; `statistics_tokens_per_loop: null` uses all tokens for
 Hessian/clip statistics. A positive cap takes the same deterministic token prefix
 in each loop and changes the statistics cache key. Activation precision is uniform
 across all projections and loops: `w4a4` uses A4 and `w4a8` uses A8. Low-rank

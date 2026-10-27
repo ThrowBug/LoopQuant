@@ -1,4 +1,4 @@
-"""Greedy loop-first block reconstruction; older rank increments never update."""
+"""Loop-first low-rank initialization with optional block reconstruction."""
 
 from pathlib import Path
 import tempfile
@@ -11,7 +11,7 @@ from .modules import iter_linears
 
 
 @torch.no_grad()
-def initialize_increment(module, original, loop, *, seed, iterations):
+def initialize_increment(module, original, loop, *, seed, iterations, trainable=True):
     residual = original.to(module.weight.device, torch.float32) - module.weight.float()
     if module.sharing == "prefix" and loop:
         a = torch.cat(tuple(module.A[:loop]), 0).float()
@@ -32,8 +32,8 @@ def initialize_increment(module, original, loop, *, seed, iterations):
     # FP32 masters during optimization; forward casts them to the base dtype.
     module.A[loop].data = (root[:, None] * vh).float()
     module.B[loop].data = (u * root[None, :]).float()
-    module.A[loop].requires_grad_(True)
-    module.B[loop].requires_grad_(True)
+    module.A[loop].requires_grad_(trainable)
+    module.B[loop].requires_grad_(trainable)
     module._inference_cache = None
 
 
@@ -54,33 +54,34 @@ def reconstruct(model, teacher, config, device, logger):
                 for index, (name, module) in enumerate(linears.items()):
                     initialize_increment(module, originals[name], loop,
                                          seed=config.calibration["seed"] + loop * 1009 + block_id * 101 + index,
-                                         iterations=options["svd_iterations"])
+                                         iterations=options["svd_iterations"], trainable=options["enabled"])
                     parameters.extend((module.A[loop], module.B[loop]))
-                optimizer = torch.optim.Adam(parameters, lr=options["learning_rate"])
                 losses = []
-                generator = torch.Generator().manual_seed(config.calibration["seed"] + loop * 1009 + block_id)
-                order = torch.randperm(samples, generator=generator).tolist()
-                batch_size = min(options["batch_size"], samples)
-                for step in range(options["steps"]):
-                    indices = [order[(step * batch_size + offset) % samples] for offset in range(batch_size)]
-                    hidden = torch.cat([load_file(state_dir / f"{i}.safetensors")["hidden"] for i in indices]).to(device)
-                    target = torch.cat([teacher.read(block_id, loop, i)["output"] for i in indices]).to(device)
-                    prediction = run_block(model, block, hidden, loop)
-                    # Equal-loop training budgets; normalize each sample's energy.
-                    error = (prediction.float() - target.float()).square().flatten(1).mean(1)
-                    energy = target.float().square().flatten(1).mean(1).clamp_min(1e-8)
-                    loss = (error / energy).mean()
-                    if not torch.isfinite(loss):
-                        raise FloatingPointError(f"non-finite reconstruction loss at loop={loop}, block={block_id}")
-                    optimizer.zero_grad(set_to_none=True)
-                    loss.backward()
-                    torch.nn.utils.clip_grad_norm_(parameters, options["gradient_clip"])
-                    optimizer.step()
-                    losses.append(float(loss.detach()))
-                    logger.info("[LowRank] loop=%d/%d block=%d/%d step=%d/%d loss=%.6g",
-                                loop + 1, config.num_loops, block_id + 1, len(model.model.layers),
-                                step + 1, options["steps"], losses[-1])
-                del optimizer
+                if options["enabled"]:
+                    optimizer = torch.optim.Adam(parameters, lr=options["learning_rate"])
+                    generator = torch.Generator().manual_seed(config.calibration["seed"] + loop * 1009 + block_id)
+                    order = torch.randperm(samples, generator=generator).tolist()
+                    batch_size = min(options["batch_size"], samples)
+                    for step in range(options["steps"]):
+                        indices = [order[(step * batch_size + offset) % samples] for offset in range(batch_size)]
+                        hidden = torch.cat([load_file(state_dir / f"{i}.safetensors")["hidden"] for i in indices]).to(device)
+                        target = torch.cat([teacher.read(block_id, loop, i)["output"] for i in indices]).to(device)
+                        prediction = run_block(model, block, hidden, loop)
+                        # Equal-loop training budgets; normalize each sample's energy.
+                        error = (prediction.float() - target.float()).square().flatten(1).mean(1)
+                        energy = target.float().square().flatten(1).mean(1).clamp_min(1e-8)
+                        loss = (error / energy).mean()
+                        if not torch.isfinite(loss):
+                            raise FloatingPointError(f"non-finite reconstruction loss at loop={loop}, block={block_id}")
+                        optimizer.zero_grad(set_to_none=True)
+                        loss.backward()
+                        torch.nn.utils.clip_grad_norm_(parameters, options["gradient_clip"])
+                        optimizer.step()
+                        losses.append(float(loss.detach()))
+                        logger.info("[LowRank] loop=%d/%d block=%d/%d step=%d/%d loss=%.6g",
+                                    loop + 1, config.num_loops, block_id + 1, len(model.model.layers),
+                                    step + 1, options["steps"], losses[-1])
+                    del optimizer
                 with torch.no_grad():
                     for module in linears.values():
                         for bank in (module.A, module.B):
@@ -91,11 +92,16 @@ def reconstruct(model, teacher, config, device, logger):
                         hidden = load_file(path)["hidden"].to(device)
                         output = run_block(model, block, hidden, loop)
                         save_file({"hidden": output.cpu().contiguous()}, path)
-                record = {"loop": loop, "block": block_id, "steps": options["steps"],
-                          "initial_loss": losses[0], "final_loss": losses[-1]}
+                record = {"loop": loop, "block": block_id, "optimization_enabled": options["enabled"],
+                          "steps": len(losses), "initial_loss": losses[0] if losses else None,
+                          "final_loss": losses[-1] if losses else None}
                 history.append(record)
-                logger.info("[LowRank] loop=%d/%d block=%d/%d loss=%.6g -> %.6g",
-                            loop + 1, config.num_loops, block_id + 1, len(model.model.layers), losses[0], losses[-1])
+                if losses:
+                    logger.info("[LowRank] loop=%d/%d block=%d/%d loss=%.6g -> %.6g",
+                                loop + 1, config.num_loops, block_id + 1, len(model.model.layers), losses[0], losses[-1])
+                else:
+                    logger.info("[LowRank] loop=%d/%d block=%d/%d initialized; optimization disabled",
+                                loop + 1, config.num_loops, block_id + 1, len(model.model.layers))
             with torch.no_grad():
                 for sample in range(samples):
                     path = state_dir / f"{sample}.safetensors"

@@ -52,10 +52,13 @@ class LowRankPipeline:
         rank = config.method["rank_step"]
         ranks = ([rank * (loop + 1) for loop in range(config.num_loops)]
                  if config.method["sharing"] == "prefix" else [rank] * config.num_loops)
+        optimize = config.method["optimization"]["enabled"]
         summary = {
             "algorithm": "low_rank", "fake_quantization": True,
             "activation_allocation": list(model._loopquant_allocation),
-            "stage_order": ["teacher_cache", "GPTQ", "incremental_block_reconstruction"],
+            "optimization_enabled": optimize,
+            "stage_order": ["teacher_cache", "GPTQ", "incremental_block_reconstruction" if optimize
+                            else "incremental_block_initialization"],
             "sharing": config.method["sharing"], "rank_step": rank, "rank_schedule": ranks,
             "low_rank_parameters": sum(parameter.numel() for parameter in parameters),
             "low_rank_bytes": sum(parameter.numel() * parameter.element_size() for parameter in parameters),
