@@ -37,10 +37,10 @@ def initialize_increment(module, original, loop, *, seed, iterations, trainable=
     module._inference_cache = None
     if logger is not None:
         values = s.tolist()
-        sampled = ", ".join(f"s{i + 1}={values[i]:.6g}" for i in range(0, (len(values) + 1) // 2, 4))
+        singular_values = ", ".join(f"s{i}={value:.6g}" for i, value in enumerate(values, 1))
         median = (values[(len(values) - 1) // 2] + values[len(values) // 2]) / 2
         logger.info("[LowRank] %s init_rank=%d singular_values=[%s] median=%.6g",
-                    label, rank, sampled, median)
+                    label, rank, singular_values, median)
 
 
 def reconstruct(model, teacher, config, device, logger):
