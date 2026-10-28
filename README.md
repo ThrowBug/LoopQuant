@@ -460,6 +460,78 @@ FP32 CGB tensors, corruption detection, all four save/evaluate combinations,
 real HF/harness generation, and shell argument/exit handling. Full Ouro GPU
 benchmarks and Linux MBPP execution must still be validated in the target setup.
 
+## FP activation analysis
+
+This separate entry point observes original FP model activations only. It does not
+quantize, fit low-rank factors, run lm-eval, or modify quantization configurations.
+It compares the same token positions at the output of each physical decoder block,
+before the outer loop's final normalization. The model follows all requested loops
+with early exit and KV caching disabled.
+
+```bash
+# Optional plotting dependency; --no-plots exports JSON/CSV without it.
+conda activate loopquant && \
+  python -m pip install --no-user -i https://mirrors.aliyun.com/pypi/simple/ matplotlib
+
+# Collect from an original model, then analyze (BF16 by default).
+# --model can also be an original local HF model directory.
+conda activate loopquant && \
+  CUDA_VISIBLE_DEVICES=0 bash scripts/analyze_activations.sh ouro_1.4b_bf16 \
+    --model ByteDance/Ouro-1.4B --num-loops 4
+
+# Reuse an existing FP teacher cache without loading a model or dataset.
+# Select the actual teacher-key directory containing manifest.json.
+conda activate loopquant && \
+  CUDA_VISIBLE_DEVICES=0 bash scripts/analyze_activations.sh ouro_1.4b_bf16 \
+    --teacher-cache cache/calibration/ouro_1.4b/<teacher_key>
+```
+
+`LOOPQUANT_PYTHON` can select another interpreter; the launcher uses `python -s`.
+Results go to `outputs/<experiment-name>/activation_analysis/`:
+
+```text
+analysis.json                  # provenance, selected positions and all metrics
+cosine_similarity.csv          # every layer and every pair of loops
+adjacent_changes.csv           # relative change and r90 for adjacent loops
+figures/cosine_similarity.png   # per-layer pairwise cosine matrices
+figures/cosine_similarity.svg
+figures/adjacent_changes.png    # layer-by-loop-transition heatmaps
+figures/adjacent_changes.svg
+run.log
+launcher.log
+```
+
+Only three metrics are computed. For block output X_t with aligned token rows:
+
+- **Cosine similarity:** average token-wise cosine for every pair of loops.
+  Zero-norm token pairs are excluded and their valid counts are recorded. An
+  entirely undefined pair is JSON `null` / an empty CSV cell.
+- **Relative change:** ||X_t - X_(t-1)||_F / ||X_(t-1)||_F computed separately
+  for each sample, then averaged across samples. Zero-to-zero is 0;
+  zero-to-nonzero is undefined and excluded with the valid sample count recorded.
+- **Increment r90:** the minimum rank explaining at least 90% of the squared
+  singular-value energy of X_t - X_(t-1), pooling aligned token rows across the
+  selected samples. It uses the eigenvalues of the smaller Gram matrix in FP32,
+  without random SVD or mean centering. An exactly zero increment has rank 0.
+
+Defaults are `--num-samples 16 --sequence-length 2048 --batch-size 4
+--tokens-per-sample 128 --seed 0 --device auto`. Original models use WikiText-2
+training windows and accept `--dtype bfloat16|float16|float32`; all statistics use
+FP32. Only sampled outputs are temporarily spooled to disk, preserving the model
+dtype, and removed after analysis. Existing FP caches are strictly read-only;
+their loop count and actual sequence length/dtype are used. The cache mode selects
+up to the requested number of samples reproducibly, and does not load its saved
+weights or create Hessian/clip caches. `--num-loops`, if supplied, must match.
+
+Token positions are sampled uniformly without replacement per sequence, sorted,
+and reused in every layer/loop. The token budget is capped by sequence length;
+sample IDs and positions are saved in `analysis.json`. Keep these budgets and seeds
+fixed when comparing results: r90 depends on the sampled matrix dimensions, and
+cache collection batch sizes can also affect floating-point rounding. Layers and
+loops in result tables are 1-based; token positions and sample IDs are 0-based.
+Falling update magnitudes or low increment ranks are observations, not by
+themselves evidence of better model quality or better low-rank compensation.
+
 ## Low-rank compensation
 
 Select `algorithm: low_rank` using the new `configs/ouro_*_low_rank.yaml` files.
