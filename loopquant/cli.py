@@ -18,7 +18,7 @@ from .utils import resolve_device, runtime_metadata, set_random_seed, setup_logg
 
 def _add_quantize_arguments(parser):
     parser.add_argument("--config", required=True, help="Quantization/calibration YAML")
-    parser.add_argument("--save", action="store_true", help="Save output-dir/loopquant before evaluation")
+    parser.add_argument("--save", action="store_true", help="Save output-dir/checkpoint before evaluation")
     parser.add_argument("--model-family", choices=("ouro", "nanbeige", "huginn"))
     parser.add_argument("--weight-bits", type=int)
     parser.add_argument("--activation-setting", choices=("w4a4", "w4a6", "w4a8"))
@@ -82,7 +82,7 @@ def _run_quantize(args):
         calibration__seed=args.calibration_seed,
     )
     output = Path(args.output_dir).expanduser().resolve()
-    checkpoint = output / "loopquant"
+    checkpoint = output / "checkpoint"
     if args.save and checkpoint.exists():
         raise FileExistsError(f"checkpoint already exists: {checkpoint}; choose a new output directory")
     logger = setup_logging(output)
@@ -128,7 +128,8 @@ def _run_quantize(args):
         logger.info("[Checkpoint] Saved %s", checkpoint)
     if _evaluation_requested(args):
         # Dataset/MBPP failures must not prevent a completed snapshot being saved.
-        run_evaluation(result.model, tokenizer, load_evaluation_config(args.eval_config), output,
+        run_evaluation(result.model, tokenizer, load_evaluation_config(args.eval_config),
+                       output / "evaluation" / "hf",
                        suites=_evaluation_suites(args), device=device,
                        run_metadata={"mode": "quantized", "model_source": str(args.model),
                                      "quantization": summary})

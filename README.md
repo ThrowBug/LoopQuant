@@ -42,38 +42,41 @@ Both launchers default to `TOKENIZERS_PARALLELISM=false` and
 `HF_ALLOW_CODE_EVAL=1`; existing environment values override these defaults.
 
 ```bash
-# Quantize -> save -> PPL/zero-shot. Reads model_path/output_dir from the run YAML.
+# Quantize -> save -> PPL/zero-shot. An omitted/empty tag adds no suffix.
 conda activate loopquant && \
-  CUDA_VISIBLE_DEVICES=0 bash scripts/quantize.sh configs/ouro_1.4b_w4a4.yaml
+  CUDA_VISIBLE_DEVICES=0 bash scripts/quantize.sh configs/ouro_1.4b_w4a4.yaml --tag baseline
 
 # vLLM: original HF model (replace the ID with a local HF directory if needed).
 conda activate loopquant-vllm && \
   USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
-  LOOPQUANT_EVAL_OUTPUT_DIR=outputs/ouro_1.4b_bf16_vllm_eval \
-  bash scripts/eval.sh ByteDance/Ouro-1.4B 4
+  bash scripts/eval.sh ouro_1.4b_bf16 --model ByteDance/Ouro-1.4B --num-loops 4
 
 # vLLM: saved fake-quantized model.
 conda activate loopquant-vllm && \
   USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
-  LOOPQUANT_EVAL_OUTPUT_DIR=outputs/ouro_1.4b_w4a4_vllm_eval \
-  bash scripts/eval.sh outputs/ouro_1.4b_w4a4/loopquant 4
+  bash scripts/eval.sh ouro_1.4b_w4a4_baseline
 
 # HF (without vLLM): original HF model, including PPL evaluation.
 conda activate loopquant && \
   USE_VLLM=0 CUDA_VISIBLE_DEVICES=0 \
-  LOOPQUANT_EVAL_OUTPUT_DIR=outputs/ouro_1.4b_bf16_hf_eval \
-  bash scripts/eval.sh ByteDance/Ouro-1.4B 4
+  bash scripts/eval.sh ouro_1.4b_bf16 --model ByteDance/Ouro-1.4B --num-loops 4
 
 # HF (without vLLM): saved fake-quantized model, including PPL evaluation.
 conda activate loopquant && \
   USE_VLLM=0 CUDA_VISIBLE_DEVICES=0 \
-  LOOPQUANT_EVAL_OUTPUT_DIR=outputs/ouro_1.4b_w4a4_hf_eval \
-  bash scripts/eval.sh outputs/ouro_1.4b_w4a4/loopquant 4
+  bash scripts/eval.sh ouro_1.4b_w4a4_baseline
 ```
 
-`eval.sh` requires the loop count as its second argument. An optional third
-argument selects another evaluation YAML (`quantize.sh`: optional second argument). The default is
+`quantize.sh` names the experiment after the config filename without its extension,
+optionally followed by `_<tag>`. It overrides the YAML's legacy `output_dir` value.
+`eval.sh` takes this experiment name, loads `outputs/<name>/checkpoint`, and reads
+`num_loops` from its manifest. For an original BF16 model, supply `--model` and
+`--num-loops`; the experiment name then only selects the result directory.
+Names and tags must be single directory names, without path separators.
+
+Both launchers accept `--eval-config FILE`. The default is
 `configs/evaluation_generative.yaml`; `LOOPQUANT_EVAL_CONFIG` overrides that default.
+`quantize.sh` also retains its previous optional positional evaluation YAML.
 `LOOPQUANT_PYTHON` optionally selects a Python executable, otherwise scripts use
 `python` from the active environment. Spaces in paths are preserved.
 
@@ -84,10 +87,39 @@ followed by existing repository-relative directories. HF IDs such as
 `ByteDance/Ouro-1.4B` pass through unchanged when no matching local directory exists.
 The `models/`, `./`, and `../` prefixes explicitly select local paths even when
 the directory is missing; absolute paths also pass through unchanged.
-`eval.sh` takes a direct model ID/path, not a
-quantization YAML. Relative paths are relative to the repository. Evaluation output
-defaults to `outputs/<model-name>_evaluation` (the parent run name for a snapshot);
-`LOOPQUANT_EVAL_OUTPUT_DIR` overrides it. Use separate output directories per run.
+For `eval.sh --model`, relative model paths are relative to the repository.
+Results follow a fixed layout; `LOOPQUANT_EVAL_OUTPUT_DIR` is no longer used:
+
+```text
+outputs/<config-stem>[_<tag>]/
+  config.yaml
+  quantization_summary.json
+  <stage-summary>.json
+  run.log
+  launcher.log
+  checkpoint/
+    checkpoint_manifest.json
+    ... model, tokenizer and tensor files ...
+  evaluation/
+    hf/                     # immediate quantization evaluation or standalone HF
+      metrics.json
+      evaluation_manifest.json
+      zero_shot/...
+      generative/<task>/...
+    vllm/                   # standalone vLLM, PPL skipped
+      metrics.json
+      evaluation_manifest.json
+      zero_shot/...
+      generative/<task>/...
+```
+
+Only selected suites produce their result files. Standalone evaluation also writes
+its protocol and logs inside the backend directory. BF16 experiments contain
+`evaluation/` without a saved checkpoint or quantization files. HF and vLLM results
+are separate; rerunning the same backend updates that backend's result files.
+Quantization refuses to overwrite an existing checkpoint; select a new tag for a
+new run. Existing output directories are not moved. The direct Python CLI still
+accepts explicit model/checkpoint paths and evaluation output directories.
 
 ### Direct CLI examples
 
@@ -105,12 +137,13 @@ HF_ALLOW_CODE_EVAL=1 python -m loopquant.cli quantize \
 
 # Evaluate a saved quantized checkpoint; only the selected suites run.
 python -m loopquant.cli evaluate \
-  --model outputs/ouro_1.4b_w4a4/loopquant --num-loops 4 \
-  --output-dir outputs/ouro_1.4b_w4a4_reeval --wikitext2 --zero-shot
+  --model outputs/ouro_1.4b_w4a4/checkpoint --num-loops 4 \
+  --output-dir outputs/ouro_1.4b_w4a4/evaluation/hf --wikitext2 --zero-shot
 
 # Full-precision baseline through the same command.
 HF_ALLOW_CODE_EVAL=1 python -m loopquant.cli evaluate \
-  --model ByteDance/Ouro-1.4B --num-loops 4 --output-dir outputs/ouro_1.4b_bf16 --generative
+  --model ByteDance/Ouro-1.4B --num-loops 4 \
+  --output-dir outputs/ouro_1.4b_bf16/evaluation/hf --generative
 ```
 
 `--eval-config` selects protocol parameters for either command. Full-precision
@@ -184,27 +217,27 @@ HF_ALLOW_CODE_EVAL=1 CUDA_VISIBLE_DEVICES=0 \
 python -s -m loopquant.cli evaluate --vllm \
   --model ByteDance/Ouro-1.4B --num-loops 4 \
   --eval-config configs/evaluation_generative.yaml \
-  --output-dir outputs/ouro_bf16_vllm --zero-shot --generative
+  --output-dir outputs/ouro_1.4b_bf16/evaluation/vllm --zero-shot --generative
 
 # Saved LoopQuant model: load the existing snapshot, then evaluate through vLLM.
 HF_ALLOW_CODE_EVAL=1 CUDA_VISIBLE_DEVICES=0 \
 python -s -m loopquant.cli evaluate --vllm \
-  --model outputs/ouro_1.4b_w4a4/loopquant --num-loops 4 \
+  --model outputs/ouro_1.4b_w4a4/checkpoint --num-loops 4 \
   --eval-config configs/evaluation_generative.yaml \
-  --output-dir outputs/ouro_1.4b_w4a4_vllm_eval --zero-shot --generative
+  --output-dir outputs/ouro_1.4b_w4a4/evaluation/vllm --zero-shot --generative
 
 # Equivalent launcher for a saved snapshot; USE_VLLM defaults to 1.
-USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
-  bash scripts/eval.sh outputs/ouro_1.4b_w4a4/loopquant 4
+conda activate loopquant-vllm && \
+  USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 bash scripts/eval.sh ouro_1.4b_w4a4
 
-# The launcher also accepts an original HF model ID or local model directory.
-USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
-  bash scripts/eval.sh ByteDance/Ouro-1.4B 4
+# Supply an original HF model ID or local model directory explicitly.
+conda activate loopquant-vllm && \
+  USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
+  bash scripts/eval.sh ouro_1.4b_bf16 --model ByteDance/Ouro-1.4B --num-loops 4
 
 # Use the original HF environment/backend (including PPL).
-conda activate loopquant
-USE_VLLM=0 \
-  bash scripts/eval.sh outputs/ouro_1.4b_w4a4/loopquant 4
+conda activate loopquant && \
+  USE_VLLM=0 CUDA_VISIBLE_DEVICES=0 bash scripts/eval.sh ouro_1.4b_w4a4
 ```
 
 `--vllm`/`USE_VLLM=1` skips WikiText/C4 PPL; it does not change the generation
@@ -246,16 +279,15 @@ with prefix caching disabled. The resolved mode is recorded in evaluation metada
 # Existing commands automatically use cached execution for saved snapshots.
 conda activate loopquant-vllm && \
   USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
-  bash scripts/eval.sh outputs/ouro_1.4b_w4a4/loopquant 4
+  bash scripts/eval.sh ouro_1.4b_w4a4
 
 # Experimental fast path; validate before using its benchmark scores.
 conda activate loopquant-vllm && \
   LOOPQUANT_VLLM_EXECUTION=fast USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
-  LOOPQUANT_EVAL_OUTPUT_DIR=outputs/ouro_1.4b_w4a4_vllm_fast_eval \
-  bash scripts/eval.sh outputs/ouro_1.4b_w4a4/loopquant 4
+  bash scripts/eval.sh ouro_1.4b_w4a4
 ```
 
-The vLLM launcher uses `python -s` to keep packages in `~/.local` out of the
+Both launchers use `python -s` to keep packages in `~/.local` out of the
 runtime import path. Direct CLI examples use the same option. vLLM's registry
 starts a separate Python interpreter without copying `-s`, so backend initialization
 also temporarily sets `PYTHONNOUSERSITE=1` for its child processes. It also sets
@@ -304,7 +336,7 @@ LOOPQUANT_VLLM_EXECUTION=cached LOOPQUANT_VLLM_TEST_MODEL=/path/to/loopquant \
 
 ## Checkpoint format
 
-`--save` writes `output-dir/loopquant` **before any evaluation task/scorer is
+`--save` writes `output-dir/checkpoint` **before any evaluation task/scorer is
 loaded**. Missing MBPP execution settings or failed scoring therefore cannot
 prevent a completed model snapshot being produced. Save errors stop the route
 before evaluation. Existing checkpoint destinations are never overwritten.
@@ -443,17 +475,15 @@ conda activate loopquant && \
 
 conda activate loopquant && \
   USE_VLLM=0 CUDA_VISIBLE_DEVICES=0 \
-  LOOPQUANT_EVAL_OUTPUT_DIR=outputs/ouro_1.4b_w4a4_low_rank_hf_eval \
-  bash scripts/eval.sh outputs/ouro_1.4b_w4a4_low_rank/loopquant 4
+  bash scripts/eval.sh ouro_1.4b_w4a4_low_rank
 
 conda activate loopquant-vllm && \
   USE_VLLM=1 CUDA_VISIBLE_DEVICES=0 \
-  LOOPQUANT_EVAL_OUTPUT_DIR=outputs/ouro_1.4b_w4a4_low_rank_vllm_eval \
-  bash scripts/eval.sh outputs/ouro_1.4b_w4a4_low_rank/loopquant 4
+  bash scripts/eval.sh ouro_1.4b_w4a4_low_rank
 ```
 
-The evaluator's loop argument must match the saved `num_loops`; four is only the
-example configuration. Low-rank vLLM currently uses `cached` execution; the
+The launcher reads the saved `num_loops` automatically; direct CLI calls must
+supply a matching `--num-loops`. Low-rank vLLM currently uses `cached` execution; the
 original LoopQuant `compiled`/`fast` modes are not enabled for this new method.
 No dependency changes or low-bit kernels are required for this path.
 
@@ -545,11 +575,12 @@ full trajectories can require substantial disk space. Temporary student states
 are removed after training. Neither training caches nor the original weights are
 needed to load a finished checkpoint.
 
-Snapshots still go to `output_dir/loopquant` before evaluation. Their manifest
+Snapshots go to `output_dir/checkpoint` before evaluation. Their manifest
 identifies `low-rank-fake-quantized` format version 1, factor layout and loop plan;
 HF and vLLM dispatch to the correct restorer automatically. The saved weights
-are floating fake-quantized tensors, not packed INT4. Use distinct `output_dir`
-values for sharing/Hessian ablations. Existing LoopQuant snapshots remain valid.
+are floating fake-quantized tensors, not packed INT4. Use distinct config filenames
+or `quantize.sh --tag` values for sharing/Hessian ablations. Existing LoopQuant
+snapshots remain valid and can be loaded by the direct CLI at their original paths.
 
 ## License
 

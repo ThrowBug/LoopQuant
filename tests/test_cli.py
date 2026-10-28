@@ -76,8 +76,9 @@ def test_quantize_route_combinations(tmp_path, monkeypatch, save, evaluate):
 
     def fake_evaluation(*args, **kwargs):
         events.append("evaluate")
+        assert args[3] == tmp_path / "evaluation" / "hf"
         if save:
-            assert (tmp_path / "loopquant/complete").exists()
+            assert (tmp_path / "checkpoint/complete").exists()
         raise RuntimeError("scorer failure")
 
     monkeypatch.setattr(loopquant.checkpoint, "save_quantized_checkpoint", fake_save)

@@ -524,10 +524,11 @@ def test_low_rank_cli_uses_same_save_then_evaluate_route(tmp_path, monkeypatch):
     events = []
 
     def evaluate(prepared, *args, **kwargs):
-        manifest = json.loads((output / "loopquant/checkpoint_manifest.json").read_text(encoding="utf-8"))
+        manifest = json.loads((output / "checkpoint/checkpoint_manifest.json").read_text(encoding="utf-8"))
         assert manifest["algorithm"] == "low_rank"
         assert manifest["allocation"] == [8, 8]
         assert prepared is model
+        assert args[2] == output / "evaluation" / "hf"
         events.append("evaluate")
 
     monkeypatch.setattr(cli, "run_evaluation", evaluate)
