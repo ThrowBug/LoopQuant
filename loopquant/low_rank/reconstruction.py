@@ -11,7 +11,7 @@ from .modules import iter_linears
 
 
 @torch.no_grad()
-def initialize_increment(module, original, loop, *, seed, iterations, trainable=True):
+def initialize_increment(module, original, loop, *, seed, iterations, trainable=True, logger=None, label=""):
     residual = original.to(module.weight.device, torch.float32) - module.weight.float()
     if module.sharing == "prefix" and loop:
         a = torch.cat(tuple(module.A[:loop]), 0).float()
@@ -35,11 +35,19 @@ def initialize_increment(module, original, loop, *, seed, iterations, trainable=
     module.A[loop].requires_grad_(trainable)
     module.B[loop].requires_grad_(trainable)
     module._inference_cache = None
+    if logger is not None:
+        values = s.tolist()
+        sampled = ", ".join(f"s{i + 1}={values[i]:.6g}" for i in range(0, (len(values) + 1) // 2, 4))
+        median = (values[(len(values) - 1) // 2] + values[len(values) // 2]) / 2
+        logger.info("[LowRank] %s init_rank=%d singular_values=[%s] median=%.6g",
+                    label, rank, sampled, median)
 
 
 def reconstruct(model, teacher, config, device, logger):
     options = config.method["optimization"]
     samples = teacher.manifest["num_samples"]
+    num_blocks = len(model.model.layers)
+    logged_blocks = {0, num_blocks // 2, num_blocks - 1}
     history = []
     with tempfile.TemporaryDirectory(prefix=".student-", dir=teacher.directory.parent) as temporary:
         state_dir = Path(temporary)
@@ -54,7 +62,10 @@ def reconstruct(model, teacher, config, device, logger):
                 for index, (name, module) in enumerate(linears.items()):
                     initialize_increment(module, originals[name], loop,
                                          seed=config.calibration["seed"] + loop * 1009 + block_id * 101 + index,
-                                         iterations=options["svd_iterations"], trainable=options["enabled"])
+                                         iterations=options["svd_iterations"], trainable=options["enabled"],
+                                         logger=logger if block_id in logged_blocks else None,
+                                         label=f"loop={loop + 1}/{config.num_loops} "
+                                         f"block={block_id + 1}/{num_blocks} module={name}")
                     parameters.extend((module.A[loop], module.B[loop]))
                 losses = []
                 if options["enabled"]:
