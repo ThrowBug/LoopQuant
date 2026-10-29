@@ -497,7 +497,9 @@ channel_statistics.csv         # per-channel RMS, energy share, previous-loop co
 channel_overlap.csv            # per-layer adjacent-loop Top-K overlap and K
 figures/adjacent_changes.png    # layer-by-loop-transition heatmaps
 figures/adjacent_changes.svg
-figures/channel_changes.png     # channel details for the selected layers
+figures/channel_rms.png         # standalone wide RMS heatmaps for selected layers
+figures/channel_rms.svg
+figures/channel_changes.png     # channel cosine and Top-K overlap for selected layers
 figures/channel_changes.svg
 run.log
 launcher.log
@@ -538,17 +540,23 @@ per-layer `channels` object in `analysis.json` and the two channel CSVs:
   for deterministic selection. If either loop is all-zero the overlap is undefined;
   tied/flat energy profiles should be interpreted together with their RMS values.
 
-The `channel_changes` figure has one row per selected physical layer. Its columns
-show an RMS heatmap (channel by loop), a response-cosine heatmap (channel by loop
-transition), and the Top-K overlap curve. Channel IDs keep their original order in
-every loop; no per-loop sorting is applied to the heatmaps. RMS uses a common
-scale across loops within each displayed layer; channel cosine uses a common scale
-across displayed layers. Each plot has its own labeled scale.
+The standalone `channel_rms` figure has one heatmap per selected layer, stacking
+layers vertically and using the full figure width for channels. PNG width grows
+with channel count, leaving about two horizontal pixels per channel at 180 DPI.
+Nearest-neighbor rendering without resampling preserves narrow bright peaks;
+view the PNG at native resolution or zoom the SVG to inspect individual channels.
+RMS retains its linear scale, with a common scale across loops within each layer.
+
+The `channel_changes` figure has one row per selected physical layer and two
+columns: the response-cosine heatmap (channel by loop transition) and the Top-K
+overlap curve. Channel IDs keep their original order in every loop; no per-loop
+sorting is applied to either figure's heatmaps. Channel cosine uses a common
+scale across displayed layers. Each plot has its own labeled scale.
 
 By default only the first, middle (`num_layers // 2 + 1`) and last layers are
 plotted, with duplicates removed for small models. Use `--plot-layers 1 13 24`,
-for example, to choose 1-based layer numbers. This changes only the channel
-figure; all layers are still included in statistics and the original block figure.
+for example, to choose 1-based layer numbers. This changes only the two channel
+figures; all layers are still included in statistics and the original block figure.
 Neither optional argument requires editing the shell launcher. Undefined channel
 values are JSON `null` / empty CSV cells. Channel IDs are 0-based.
 

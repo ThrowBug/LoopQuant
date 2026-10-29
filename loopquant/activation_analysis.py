@@ -313,23 +313,35 @@ def _plot_channels(result, directory, plt):
     cosines = [value for layer in selected for row in layers[layer]["channels"]["adjacent_cosine"]
                for value in row if value is not None]
     cosine_min = min(0.99, min(cosines)) if cosines else 0
-    figure, axes = plt.subplots(len(selected), 3, figsize=(15, 2.8 * len(selected)),
+    width = max(len(layers[layer]["channels"]["rms"][0]) for layer in selected)
+    # At 180 DPI leave about two pixels per channel, including layout margins.
+    figure, axes = plt.subplots(len(selected), 1, figsize=(max(16, width / 80), 2.2 * len(selected)),
+                                dpi=180, squeeze=False, constrained_layout=True)
+    for axis, layer in zip(axes[:, 0], selected):
+        rms = np.array(layers[layer]["channels"]["rms"], dtype=float)
+        image = axis.imshow(rms, aspect="auto", cmap="viridis", vmin=0,
+                            interpolation="nearest", resample=False)
+        axis.set(title=f"Layer {layer}: channel RMS", xlabel="Channel (0-based)", ylabel="Loop",
+                 xticks=np.linspace(0, rms.shape[1] - 1, min(9, rms.shape[1]), dtype=int),
+                 yticks=range(loops), yticklabels=range(1, loops + 1))
+        figure.colorbar(image, ax=axis, fraction=0.015, pad=0.01, label="RMS")
+    figure.suptitle("FP channel RMS (original channel order; linear scale)")
+    _save_figure(figure, directory / "channel_rms")
+    plt.close(figure)
+
+    figure, axes = plt.subplots(len(selected), 2, figsize=(12, 2.8 * len(selected)),
                                 squeeze=False, constrained_layout=True)
     for row, layer in enumerate(selected):
         channels = layers[layer]["channels"]
         width = len(channels["rms"][0])
         ticks = np.linspace(0, width - 1, min(5, width), dtype=int)
-        for axis, data, title, labels, limits in (
-            (axes[row, 0], channels["rms"], "channel RMS", list(range(1, loops + 1)), {"vmin": 0}),
-            (axes[row, 1], channels["adjacent_cosine"], "channel cosine", transitions,
-             {"vmin": cosine_min, "vmax": 1}),
-        ):
-            image = axis.imshow(np.array(data, dtype=float), aspect="auto", cmap="viridis", **limits)
-            axis.set(title=f"Layer {layer}: {title}", xlabel="Channel (0-based)", xticks=ticks,
-                     yticks=range(len(labels)), yticklabels=labels,
-                     ylabel="Loop" if title == "channel RMS" else "Loop transition")
-            figure.colorbar(image, ax=axis)
-        axis = axes[row, 2]
+        axis = axes[row, 0]
+        image = axis.imshow(np.array(channels["adjacent_cosine"], dtype=float), aspect="auto",
+                            cmap="viridis", vmin=cosine_min, vmax=1)
+        axis.set(title=f"Layer {layer}: channel cosine", xlabel="Channel (0-based)", xticks=ticks,
+                 yticks=range(loops - 1), yticklabels=transitions, ylabel="Loop transition")
+        figure.colorbar(image, ax=axis)
+        axis = axes[row, 1]
         axis.plot(range(loops - 1), np.array(channels["topk_overlap"], dtype=float), marker="o")
         axis.set(title=f"Layer {layer}: top-{channels['topk_ratio'] * 100:g}% overlap (K={channels['topk_k']})",
                  xlabel="Loop transition", ylabel="Top-K overlap", ylim=(-0.05, 1.05),

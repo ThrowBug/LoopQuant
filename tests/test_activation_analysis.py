@@ -221,14 +221,45 @@ def test_cache_cli_artifacts_are_read_only_and_do_not_load_a_model(tmp_path, fp_
     with (output / "channel_overlap.csv").open(newline="") as stream:
         rows = list(csv.DictReader(stream))
         assert len(rows) == 2 * 2 and all(row["topk_k"] == "4" for row in rows)
-    for stem in ("adjacent_changes", "channel_changes"):
+    for stem in ("adjacent_changes", "channel_rms", "channel_changes"):
         assert (output / "figures" / f"{stem}.png").read_bytes().startswith(b"\x89PNG")
         assert "<svg" in (output / "figures" / f"{stem}.svg").read_text(encoding="utf-8")
     assert {path.name for path in (output / "figures").iterdir()} == {
-        "adjacent_changes.png", "adjacent_changes.svg", "channel_changes.png", "channel_changes.svg"}
+        "adjacent_changes.png", "adjacent_changes.svg", "channel_rms.png", "channel_rms.svg",
+        "channel_changes.png", "channel_changes.svg"}
     after = {path.relative_to(directory): hashlib.sha256(path.read_bytes()).hexdigest()
              for path in directory.rglob("*") if path.is_file()}
     assert before == after
+
+
+def test_wide_rms_plot_preserves_a_single_bright_channel(tmp_path, monkeypatch):
+    import numpy as np
+    plt = analysis._plotting()
+    rms = np.full((4, 2048), 0.1)
+    peak = 173
+    rms[:, peak] = 100
+    result = {"num_loops": 4, "plot_layers": [1], "layers": [{"layer": 1, "channels": {
+        "rms": rms.tolist(), "adjacent_cosine": np.ones((3, 2048)).tolist(),
+        "topk_overlap": [1, 1, 1], "topk_ratio": 0.01, "topk_k": 21,
+    }}]}
+    checked = []
+
+    def inspect_figure(figure, path):
+        if path.name != "channel_rms":
+            return
+        figure.canvas.draw()
+        axis = figure.axes[0]
+        assert axis.get_window_extent().width >= 2 * rms.shape[1]
+        pixels = np.asarray(figure.canvas.buffer_rgba())
+        x, y = axis.transData.transform((peak, 1))
+        actual = pixels[pixels.shape[0] - 1 - int(y), int(x), :3] / 255
+        expected = plt.get_cmap("viridis")(1.0)[:3]
+        assert np.allclose(actual, expected, atol=0.01)
+        checked.append(path.name)
+
+    monkeypatch.setattr(analysis, "_save_figure", inspect_figure)
+    analysis._plot_channels(result, tmp_path, plt)
+    assert checked == ["channel_rms"]
 
 
 def test_model_cli_stays_fp_and_cleans_temporary_outputs(tmp_path, fp_cache, monkeypatch):
