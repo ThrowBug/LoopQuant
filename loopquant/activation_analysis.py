@@ -5,6 +5,7 @@ import csv
 import hashlib
 import inspect
 import json
+import math
 from pathlib import Path
 import tempfile
 import time
@@ -38,7 +39,43 @@ def increment_r90(increment):
 
 
 @torch.no_grad()
-def layer_metrics(states, device="cpu"):
+def channel_metrics(states, topk_ratio=0.01):
+    """Pool sample/token rows, preserving physical channel IDs in every loop."""
+    if not 0 < topk_ratio <= 1:
+        raise ValueError("channel_topk_ratio must be in (0, 1]")
+    states = states.float()
+    energy = states.square().mean(dim=(1, 2))
+    rms = energy.sqrt()
+    totals = energy.sum(-1)
+    shares = [row.div(total).tolist() if total > 0 else [None] * len(row)
+              for row, total in zip(energy, totals)]
+    k = max(1, math.ceil(topk_ratio * states.shape[-1]))
+    # Stable descending sort preserves ascending channel IDs at equal energies.
+    ranked = torch.argsort(energy, dim=-1, descending=True, stable=True)[:, :k].tolist()
+    indices = [row if total > 0 else None for row, total in zip(ranked, totals)]
+    cosine, overlap = [], []
+    for loop in range(1, len(states)):
+        valid = (energy[loop - 1] > 0) & (energy[loop] > 0)
+        denominator = rms[loop - 1] * rms[loop]
+        value = ((states[loop - 1] * states[loop]).mean(dim=(0, 1)) /
+                 denominator.clamp_min(torch.finfo(torch.float32).tiny)).clamp(-1, 1)
+        cosine.append([number if active else None for number, active in zip(value.tolist(), valid.tolist())])
+        previous, current = indices[loop - 1], indices[loop]
+        overlap.append(len(set(previous) & set(current)) / k
+                       if previous is not None and current is not None else None)
+    return {"rms": rms.tolist(), "energy_share": shares, "adjacent_cosine": cosine,
+            "topk_ratio": topk_ratio, "topk_k": k, "topk_indices": indices, "topk_overlap": overlap}
+
+
+def select_plot_layers(num_layers, requested=None):
+    layers = list(dict.fromkeys(requested if requested is not None else [1, num_layers // 2 + 1, num_layers]))
+    if not layers or any(layer < 1 or layer > num_layers for layer in layers):
+        raise ValueError(f"--plot-layers must contain layer numbers in 1..{num_layers}")
+    return layers
+
+
+@torch.no_grad()
+def layer_metrics(states, device="cpu", *, channel_topk_ratio=0.01):
     """states: [loop, sample, aligned token, feature]. No centering/rescaling."""
     if states.ndim != 4 or states.shape[0] < 2 or any(size == 0 for size in states.shape):
         raise ValueError("expected nonempty [loop>=2, sample, token, feature] activations")
@@ -75,7 +112,8 @@ def layer_metrics(states, device="cpu"):
             "r90": increment_r90(delta), "max_rank": min(samples * tokens, width),
         })
     return {"shape": list(states.shape), "cosine_similarity": cosine,
-            "cosine_valid_tokens": counts, "adjacent": adjacent}
+            "cosine_valid_tokens": counts, "adjacent": adjacent,
+            "channels": channel_metrics(states, channel_topk_ratio)}
 
 
 def _checksum(path):
@@ -203,6 +241,24 @@ def write_tables(result, output):
             for entry in layer["adjacent"]:
                 writer.writerow([layer["layer"], *[entry[key] for key in (
                     "from_loop", "to_loop", "relative_change", "r90", "max_rank")]])
+    with (output / "channel_statistics.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["layer", "loop", "channel", "rms", "energy_share", "cosine_with_previous_loop"])
+        for layer in result["layers"]:
+            channels = layer["channels"]
+            for loop, row in enumerate(channels["rms"]):
+                for channel, value in enumerate(row):
+                    cosine = channels["adjacent_cosine"][loop - 1][channel] if loop else None
+                    writer.writerow([layer["layer"], loop + 1, channel, value,
+                                     channels["energy_share"][loop][channel], cosine])
+    with (output / "channel_overlap.csv").open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["layer", "from_loop", "to_loop", "topk_ratio", "topk_k", "overlap"])
+        for layer in result["layers"]:
+            channels = layer["channels"]
+            for loop, value in enumerate(channels["topk_overlap"]):
+                writer.writerow([layer["layer"], loop + 1, loop + 2,
+                                 channels["topk_ratio"], channels["topk_k"], value])
 
 
 def _plotting():
@@ -222,35 +278,20 @@ def plot_results(result, output):
     plt = _plotting()
     directory = output / "figures"
     directory.mkdir(exist_ok=True)
+    # Remove this report's obsolete standalone plots when rerunning an analysis.
+    for suffix in (".png", ".svg"):
+        (directory / f"cosine_similarity{suffix}").unlink(missing_ok=True)
     layers, loops = result["layers"], result["num_loops"]
-    cosines = [value for layer in layers for row in layer["cosine_similarity"]
-               for value in row if value is not None]
+    values = [
+        [[layer["cosine_similarity"][loop - 1][loop] for loop in range(1, loops)] for layer in layers],
+        [[entry["relative_change"] for entry in layer["adjacent"]] for layer in layers],
+        [[entry["r90"] for entry in layer["adjacent"]] for layer in layers],
+    ]
+    cosines = [value for row in values[0] for value in row if value is not None]
     cosine_min = min(0.99, min(cosines)) if cosines else 0
-    columns = min(4, len(layers))
-    rows = (len(layers) + columns - 1) // columns
     with plt.rc_context({"font.family": "DejaVu Sans", "svg.fonttype": "none"}):
-        figure, axes = plt.subplots(rows, columns, figsize=(3.2 * columns, 3 * rows),
-                                    squeeze=False, constrained_layout=True)
-        for axis, layer in zip(axes.flat, layers):
-            image = axis.imshow(np.array(layer["cosine_similarity"], dtype=float),
-                                vmin=cosine_min, vmax=1, cmap="viridis", origin="upper")
-            axis.set(title=f"Layer {layer['layer']}", xlabel="Loop", ylabel="Loop",
-                     xticks=range(loops), xticklabels=range(1, loops + 1),
-                     yticks=range(loops), yticklabels=range(1, loops + 1))
-        for axis in list(axes.flat)[len(layers):]:
-            axis.set_visible(False)
-        figure.colorbar(image, ax=list(axes.flat)[:len(layers)], label="Mean token cosine")
-        figure.suptitle("FP decoder outputs: pairwise loop cosine similarity")
-        _save_figure(figure, directory / "cosine_similarity")
-        plt.close(figure)
-
         figure, axes = plt.subplots(1, 3, figsize=(13, max(4, len(layers) * 0.25)),
                                     constrained_layout=True)
-        values = [
-            [[layer["cosine_similarity"][loop - 1][loop] for loop in range(1, loops)] for layer in layers],
-            [[entry["relative_change"] for entry in layer["adjacent"]] for layer in layers],
-            [[entry["r90"] for entry in layer["adjacent"]] for layer in layers],
-        ]
         for axis, data, title in zip(axes, values, ("Adjacent-loop cosine", "Relative change (sample mean)", "Increment r90")):
             limits = {"vmin": cosine_min, "vmax": 1} if title == "Adjacent-loop cosine" else {"vmin": 0}
             image = axis.imshow(np.array(data, dtype=float), aspect="auto", cmap="viridis", **limits)
@@ -260,6 +301,43 @@ def plot_results(result, output):
             figure.colorbar(image, ax=axis)
         _save_figure(figure, directory / "adjacent_changes")
         plt.close(figure)
+        _plot_channels(result, directory, plt)
+
+
+def _plot_channels(result, directory, plt):
+    import numpy as np
+    layers = {layer["layer"]: layer for layer in result["layers"]}
+    selected = select_plot_layers(len(layers), result.get("plot_layers"))
+    loops = result["num_loops"]
+    transitions = [f"{loop}→{loop + 1}" for loop in range(1, loops)]
+    cosines = [value for layer in selected for row in layers[layer]["channels"]["adjacent_cosine"]
+               for value in row if value is not None]
+    cosine_min = min(0.99, min(cosines)) if cosines else 0
+    figure, axes = plt.subplots(len(selected), 3, figsize=(15, 2.8 * len(selected)),
+                                squeeze=False, constrained_layout=True)
+    for row, layer in enumerate(selected):
+        channels = layers[layer]["channels"]
+        width = len(channels["rms"][0])
+        ticks = np.linspace(0, width - 1, min(5, width), dtype=int)
+        for axis, data, title, labels, limits in (
+            (axes[row, 0], channels["rms"], "channel RMS", list(range(1, loops + 1)), {"vmin": 0}),
+            (axes[row, 1], channels["adjacent_cosine"], "channel cosine", transitions,
+             {"vmin": cosine_min, "vmax": 1}),
+        ):
+            image = axis.imshow(np.array(data, dtype=float), aspect="auto", cmap="viridis", **limits)
+            axis.set(title=f"Layer {layer}: {title}", xlabel="Channel (0-based)", xticks=ticks,
+                     yticks=range(len(labels)), yticklabels=labels,
+                     ylabel="Loop" if title == "channel RMS" else "Loop transition")
+            figure.colorbar(image, ax=axis)
+        axis = axes[row, 2]
+        axis.plot(range(loops - 1), np.array(channels["topk_overlap"], dtype=float), marker="o")
+        axis.set(title=f"Layer {layer}: top-{channels['topk_ratio'] * 100:g}% overlap (K={channels['topk_k']})",
+                 xlabel="Loop transition", ylabel="Top-K overlap", ylim=(-0.05, 1.05),
+                 xticks=range(loops - 1), xticklabels=transitions)
+        axis.grid(alpha=0.25)
+    figure.suptitle("FP channel statistics (channel IDs preserved across loops)")
+    _save_figure(figure, directory / "channel_changes")
+    plt.close(figure)
 
 
 def _save_figure(figure, path):
@@ -279,6 +357,10 @@ def build_parser():
     parser.add_argument("--batch-size", type=int, default=4, help="FP model mode only")
     parser.add_argument("--tokens-per-sample", type=int, default=128, help="Aligned random positions; capped by sequence length")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--channel-topk-ratio", type=float, default=0.01,
+                        help="Fraction of high-energy channels for adjacent-loop overlap (default 1%%)")
+    parser.add_argument("--plot-layers", type=int, nargs="+",
+                        help="1-based layers for channel figures; default first/middle/last")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16",
                         help="Original model dtype; statistics always use FP32")
@@ -286,10 +368,10 @@ def build_parser():
     return parser
 
 
-def _analyze_layers(reader, num_blocks, result, output, device, logger):
+def _analyze_layers(reader, num_blocks, result, output, device, logger, *, channel_topk_ratio=0.01):
     for block in range(num_blocks):
         started = time.perf_counter()
-        metrics = layer_metrics(reader(block), device)
+        metrics = layer_metrics(reader(block), device, channel_topk_ratio=channel_topk_ratio)
         result["layers"].append({"layer": block + 1, **metrics})
         save_json(output / "analysis.json", result)
         logger.info("[ActivationAnalysis] layer=%d/%d elapsed=%.1fs", block + 1, num_blocks, time.perf_counter() - started)
@@ -302,6 +384,10 @@ def main(argv=None):
         parser.error("--model requires --num-loops")
     if args.num_loops is not None and args.num_loops < 2:
         parser.error("at least two loops are required")
+    if not 0 < args.channel_topk_ratio <= 1:
+        parser.error("--channel-topk-ratio must be in (0, 1]")
+    if args.plot_layers is not None and any(layer < 1 for layer in args.plot_layers):
+        parser.error("--plot-layers must contain positive 1-based layer numbers")
     for name in ("num_samples", "sequence_length", "batch_size", "tokens_per_sample"):
         if getattr(args, name) <= 0:
             parser.error(f"--{name.replace('_', '-')} must be positive")
@@ -328,17 +414,23 @@ def main(argv=None):
               "definitions": {"cosine": "mean aligned-token cosine; zero-norm pairs excluded",
                               "relative_change": "mean of per-sample Frobenius ratios; zero-to-zero=0, zero-to-nonzero=undefined",
                               "r90": "minimum rank explaining >=90% energy of pooled uncentered adjacent-loop increments; zero increment=0",
-                              "indices": "layers and loops are 1-based; sample IDs and token positions are 0-based"}}
+                              "channel_rms": "sqrt(mean squared activation over pooled sample/token rows)",
+                              "channel_energy_share": "per-channel squared RMS / sum squared RMS; zero-total loop=undefined",
+                              "channel_cosine": "adjacent-loop cosine along pooled token rows for the same channel; zero norms=undefined",
+                              "channel_topk_overlap": "intersection size / K, K=ceil(ratio*width); energy ties use ascending channel IDs; zero-total loop=undefined",
+                              "indices": "layers and loops are 1-based; channels, sample IDs and token positions are 0-based"}}
     try:
         if args.teacher_cache:
             cache = FPTeacherOutputs(args.teacher_cache, args.num_samples, args.tokens_per_sample, args.seed, args.num_loops)
+            result["plot_layers"] = select_plot_layers(cache.num_blocks, args.plot_layers)
             result["num_loops"] = cache.num_loops
             result["source"] = {"mode": "teacher_cache", "path": str(cache.directory),
                                 "identity": cache.manifest["identity"], "sequence_length": cache.sequence_length}
             sample_ids, positions = cache.sample_ids, cache.positions
             result["sampling"] = {"sample_ids": sample_ids, "token_positions": [p.tolist() for p in positions]}
             logger.info("[ActivationAnalysis] Read-only FP cache: %s; samples=%d/%d", cache.directory, len(sample_ids), cache.manifest["num_samples"])
-            _analyze_layers(cache.read_layer, cache.num_blocks, result, output, device, logger)
+            _analyze_layers(cache.read_layer, cache.num_blocks, result, output, device, logger,
+                            channel_topk_ratio=args.channel_topk_ratio)
         else:
             from .models import load_looped_transformer
             from .data import load_calibration_data
@@ -346,6 +438,7 @@ def main(argv=None):
             model, tokenizer = load_looped_transformer(
                 args.model, num_loops=args.num_loops, device=device, dtype=getattr(torch, args.dtype),
                 algorithm="activation_analysis", configure_context=False)
+            result["plot_layers"] = select_plot_layers(len(model.model.layers), args.plot_layers)
             sequences = load_calibration_data(tokenizer, num_samples=args.num_samples,
                                               sequence_length=args.sequence_length, seed=args.seed,
                                               cache_dir=Path("cache/calibration/tokens"))
@@ -363,7 +456,8 @@ def main(argv=None):
                 if device.startswith("cuda"):
                     torch.cuda.empty_cache()
                 _analyze_layers(lambda block: _read_collected_layer(directory, block, args.num_loops,
-                                len(sequences), args.batch_size), blocks, result, output, device, logger)
+                                len(sequences), args.batch_size), blocks, result, output, device, logger,
+                                channel_topk_ratio=args.channel_topk_ratio)
         write_tables(result, output)
         if not args.no_plots:
             plot_results(result, output)

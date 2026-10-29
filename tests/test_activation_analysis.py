@@ -64,6 +64,65 @@ def test_undefined_relative_change_and_invalid_states():
             analysis.layer_metrics(states)
 
 
+def test_channel_scale_sign_and_zero_channels():
+    base = torch.tensor([[[1., 2., 0., 0.], [-1., 2., 0., 0.]]])
+    channels = analysis.layer_metrics(torch.stack([base, base * 2, -base * 2]),
+                                      channel_topk_ratio=0.25)["channels"]
+    assert torch.tensor(channels["rms"]).allclose(torch.tensor([[1., 2., 0., 0.],
+                                                               [2., 4., 0., 0.], [2., 4., 0., 0.]]))
+    for share in channels["energy_share"]:
+        assert share == pytest.approx([0.2, 0.8, 0, 0])
+    assert channels["adjacent_cosine"] == [[1, 1, None, None], [-1, -1, None, None]]
+    assert channels["topk_k"] == 1 and channels["topk_indices"] == [[1], [1], [1]]
+    assert channels["topk_overlap"] == [1, 1]
+
+
+def test_channel_energy_migration_uses_ceil_rank_and_preserves_ids():
+    states = torch.tensor([[[[3., 2., 1.], [3., 2., 1.]]],
+                           [[[1., 2., 3.], [1., 2., 3.]]]])
+    channels = analysis.layer_metrics(states, channel_topk_ratio=0.5)["channels"]
+    assert channels["topk_k"] == 2  # ceil(3*0.5), rather than truncating to one.
+    assert channels["topk_indices"] == [[0, 1], [2, 1]]
+    assert channels["topk_overlap"] == [0.5]
+    assert channels["adjacent_cosine"][0] == pytest.approx([1, 1, 1])
+    assert channels["energy_share"][0] == pytest.approx([9 / 14, 4 / 14, 1 / 14])
+    assert channels["energy_share"][1] == pytest.approx([1 / 14, 4 / 14, 9 / 14])
+
+
+def test_channel_response_can_change_at_constant_rms():
+    states = torch.tensor([[[[1., 0.], [0., 1.]]], [[[0., 1.], [1., 0.]]]])
+    channels = analysis.layer_metrics(states)["channels"]
+    assert channels["rms"][0] == channels["rms"][1]
+    assert channels["adjacent_cosine"] == [[0, 0]]
+
+
+def test_channel_ties_and_zero_total_energy():
+    tied = analysis.layer_metrics(torch.ones(2, 1, 3, 4), channel_topk_ratio=0.5)["channels"]
+    assert tied["topk_indices"] == [[0, 1], [0, 1]]
+    assert tied["topk_overlap"] == [1]
+    zero = analysis.layer_metrics(torch.zeros(2, 1, 3, 4))["channels"]
+    assert zero["rms"] == [[0] * 4] * 2
+    assert zero["energy_share"] == [[None] * 4] * 2
+    assert zero["adjacent_cosine"] == [[None] * 4]
+    assert zero["topk_indices"] == [None, None] and zero["topk_overlap"] == [None]
+
+
+@pytest.mark.parametrize("ratio", [0, -0.1, 1.1, float("nan"), float("inf")])
+def test_channel_ratio_validation(ratio):
+    with pytest.raises(ValueError, match="channel_topk_ratio"):
+        analysis.layer_metrics(torch.ones(2, 1, 2, 3), channel_topk_ratio=ratio)
+
+
+def test_channel_plot_layer_selection():
+    assert analysis.select_plot_layers(24) == [1, 13, 24]
+    assert analysis.select_plot_layers(2) == [1, 2]
+    assert analysis.select_plot_layers(1) == [1]
+    assert analysis.select_plot_layers(5, [4, 1, 4]) == [4, 1]
+    for requested in ([], [0], [25]):
+        with pytest.raises(ValueError, match="plot-layers"):
+            analysis.select_plot_layers(24, requested)
+
+
 @pytest.fixture
 def fp_cache(tmp_path):
     # A real pre-existing teacher cache, generated without quantizing the model.
@@ -100,6 +159,7 @@ def test_collection_matches_existing_cache_without_modifying_model(tmp_path, fp_
     for block in range(blocks):
         actual = analysis._read_collected_layer(directory, block, 3, 2, 2)
         assert torch.equal(actual, source.read_layer(block))
+        assert analysis.layer_metrics(actual)["channels"] == analysis.layer_metrics(source.read_layer(block))["channels"]
         assert actual.shape == (3, 2, 3, 32)
         assert not model.model.layers[block]._forward_hooks
     assert all(torch.equal(value, original[name]) for name, value in model.state_dict().items())
@@ -136,20 +196,36 @@ def test_cache_cli_artifacts_are_read_only_and_do_not_load_a_model(tmp_path, fp_
     before = {path.relative_to(directory): hashlib.sha256(path.read_bytes()).hexdigest()
               for path in directory.rglob("*") if path.is_file()}
     output = tmp_path / "analysis"
+    (output / "figures").mkdir(parents=True)
+    for suffix in (".png", ".svg"):
+        (output / "figures" / f"cosine_similarity{suffix}").write_bytes(b"obsolete plot")
     monkeypatch.setenv("MPLCONFIGDIR", str(tmp_path / "matplotlib"))
     assert analysis.main(["--teacher-cache", str(directory), "--output-dir", str(output),
-                          "--num-samples", "2", "--tokens-per-sample", "3", "--device", "cpu"]) == 0
+                          "--num-samples", "2", "--tokens-per-sample", "3", "--device", "cpu",
+                          "--plot-layers", "2", "--channel-topk-ratio", "0.1"]) == 0
     result = json.loads((output / "analysis.json").read_text(encoding="utf-8"))
     assert result["status"] == "complete" and result["num_loops"] == 3
     assert len(result["layers"]) == 2 and result["source"]["mode"] == "teacher_cache"
+    assert result["plot_layers"] == [2]  # Statistics still include every layer.
     assert result["layers"][0]["shape"] == [3, 2, 3, model.config.hidden_size]
     with (output / "cosine_similarity.csv").open(newline="") as stream:
         assert len(list(csv.DictReader(stream))) == 2 * 3 * 3
     with (output / "adjacent_changes.csv").open(newline="") as stream:
         assert len(list(csv.DictReader(stream))) == 2 * 2
-    for stem in ("cosine_similarity", "adjacent_changes"):
+    with (output / "channel_statistics.csv").open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+        assert len(rows) == 2 * 3 * model.config.hidden_size
+        assert {int(row["channel"]) for row in rows} == set(range(model.config.hidden_size))
+        assert all(row["cosine_with_previous_loop"] == "" for row in rows if row["loop"] == "1")
+        assert all(row["cosine_with_previous_loop"] != "" for row in rows if row["loop"] != "1")
+    with (output / "channel_overlap.csv").open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+        assert len(rows) == 2 * 2 and all(row["topk_k"] == "4" for row in rows)
+    for stem in ("adjacent_changes", "channel_changes"):
         assert (output / "figures" / f"{stem}.png").read_bytes().startswith(b"\x89PNG")
         assert "<svg" in (output / "figures" / f"{stem}.svg").read_text(encoding="utf-8")
+    assert {path.name for path in (output / "figures").iterdir()} == {
+        "adjacent_changes.png", "adjacent_changes.svg", "channel_changes.png", "channel_changes.svg"}
     after = {path.relative_to(directory): hashlib.sha256(path.read_bytes()).hexdigest()
              for path in directory.rglob("*") if path.is_file()}
     assert before == after
@@ -173,6 +249,8 @@ def test_model_cli_stays_fp_and_cleans_temporary_outputs(tmp_path, fp_cache, mon
     assert calls[0][1]["algorithm"] != "loopquant" and not calls[0][1]["configure_context"]
     result = json.loads((output / "analysis.json").read_text(encoding="utf-8"))
     assert result["status"] == "complete" and result["source"]["mode"] == "original_model"
+    assert result["plot_layers"] == [1, 2]
+    assert (output / "channel_statistics.csv").is_file() and (output / "channel_overlap.csv").is_file()
     assert not list(output.glob(".fp-outputs-*"))
     assert not (output / "figures").exists()
 
@@ -187,7 +265,10 @@ def test_cli_rejects_quantized_checkpoint_and_cache_writes(tmp_path, fp_cache):
     with pytest.raises(SystemExit):
         analysis.main(["--model", str(checkpoint), "--num-loops", "4", "--output-dir", str(tmp_path / "out")])
     for args in (["--model", "unused"], ["--model", "unused", "--num-loops", "1"],
-                 ["--teacher-cache", "unused", "--num-samples", "0"]):
+                 ["--teacher-cache", "unused", "--num-samples", "0"],
+                 ["--teacher-cache", "unused", "--channel-topk-ratio", "0"],
+                 ["--teacher-cache", "unused", "--channel-topk-ratio", "nan"],
+                 ["--teacher-cache", "unused", "--plot-layers", "0"]):
         with pytest.raises(SystemExit):
             analysis.main([*args, "--output-dir", str(tmp_path / "out")])
 
@@ -211,11 +292,14 @@ def test_analysis_launcher_routes_arguments_and_exit_status(tmp_path):
                RECORDER=recorder.as_posix(), CAPTURE=str(capture))
     env["PATH"] = str(Path(bash).parent) + os.pathsep + env.get("PATH", "")
     command = [bash, (root / "scripts/analyze_activations.sh").as_posix(), "fp experiment",
-               "--teacher-cache", (tmp_path / "FP cache").as_posix()]
+               "--teacher-cache", (tmp_path / "FP cache").as_posix(),
+               "--channel-topk-ratio", "0.05", "--plot-layers", "2", "5"]
     completed = subprocess.run(command, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
     assert completed.returncode == 0, completed.stderr
     args = json.loads(capture.read_text())
     assert args[:3] == ["-s", "-m", "loopquant.activation_analysis"]
+    assert args[args.index("--channel-topk-ratio") + 1] == "0.05"
+    assert args[args.index("--plot-layers") + 1:args.index("--plot-layers") + 3] == ["2", "5"]
     assert args[args.index("--teacher-cache") + 1].replace("\\", "/") == (tmp_path / "FP cache").as_posix()
     assert args[args.index("--output-dir") + 1].replace("\\", "/") == (root / "outputs/fp experiment/activation_analysis").as_posix()
     assert "outputs subdirectory: fp experiment" in completed.stdout

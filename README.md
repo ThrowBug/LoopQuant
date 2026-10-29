@@ -483,7 +483,7 @@ conda activate loopquant && \
 # Select the actual teacher-key directory containing manifest.json.
 conda activate loopquant && \
   CUDA_VISIBLE_DEVICES=0 bash scripts/analyze_activations.sh ouro_1.4b_bf16 \
-    --teacher-cache cache/calibration/ouro_1.4b/<teacher_key>
+    --teacher-cache 'cache/calibration/ouro_1.4b/<teacher_key>'
 ```
 
 `LOOPQUANT_PYTHON` can select another interpreter; the launcher uses `python -s`.
@@ -493,15 +493,21 @@ Results go to `outputs/<experiment-name>/activation_analysis/`:
 analysis.json                  # provenance, selected positions and all metrics
 cosine_similarity.csv          # every layer and every pair of loops
 adjacent_changes.csv           # relative change and r90 for adjacent loops
-figures/cosine_similarity.png   # per-layer pairwise cosine matrices
-figures/cosine_similarity.svg
+channel_statistics.csv         # per-channel RMS, energy share, previous-loop cosine
+channel_overlap.csv            # per-layer adjacent-loop Top-K overlap and K
 figures/adjacent_changes.png    # layer-by-loop-transition heatmaps
 figures/adjacent_changes.svg
+figures/channel_changes.png     # channel details for the selected layers
+figures/channel_changes.svg
 run.log
 launcher.log
 ```
 
-Only three metrics are computed. For block output X_t with aligned token rows:
+The `adjacent_changes` figure shows adjacent-loop cosine, relative change and increment r90.
+Full pairwise cosine values remain in JSON/CSV. Regenerating plots also removes
+obsolete `figures/cosine_similarity.png` and `.svg` from that report directory.
+
+The three block-level metrics use output X_t with aligned token rows:
 
 - **Cosine similarity:** average token-wise cosine for every pair of loops.
   Zero-norm token pairs are excluded and their valid counts are recorded. An
@@ -513,6 +519,38 @@ Only three metrics are computed. For block output X_t with aligned token rows:
   singular-value energy of X_t - X_(t-1), pooling aligned token rows across the
   selected samples. It uses the eigenvalues of the smaller Gram matrix in FP32,
   without random SVD or mean centering. An exactly zero increment has rank 0.
+
+Channel statistics reuse the same loaded FP outputs, without another forward or
+another pass over the teacher cache. Every layer and channel is saved in the
+per-layer `channels` object in `analysis.json` and the two channel CSVs:
+
+- **Channel RMS and energy share:** RMS over all selected sample/token rows for
+  each loop/channel. Energy share is squared RMS divided by the sum of squared
+  RMS across channels; an all-zero loop has undefined shares.
+- **Channel response cosine:** adjacent-loop cosine for the same channel over
+  aligned token rows, without centering. This fixes the channel and compares its
+  token response, whereas the block metric fixes a token and compares its channel
+  vector. Zero-norm channel responses are undefined. The first loop's CSV entry
+  is empty because it has no previous loop.
+- **High-energy channel overlap:** intersection size / K for adjacent Top-K sets,
+  with `K = max(1, ceil(channel_topk_ratio * width))`. Default
+  `--channel-topk-ratio 0.01` selects the highest 1%. Ties use ascending channel IDs
+  for deterministic selection. If either loop is all-zero the overlap is undefined;
+  tied/flat energy profiles should be interpreted together with their RMS values.
+
+The `channel_changes` figure has one row per selected physical layer. Its columns
+show an RMS heatmap (channel by loop), a response-cosine heatmap (channel by loop
+transition), and the Top-K overlap curve. Channel IDs keep their original order in
+every loop; no per-loop sorting is applied to the heatmaps. RMS uses a common
+scale across loops within each displayed layer; channel cosine uses a common scale
+across displayed layers. Each plot has its own labeled scale.
+
+By default only the first, middle (`num_layers // 2 + 1`) and last layers are
+plotted, with duplicates removed for small models. Use `--plot-layers 1 13 24`,
+for example, to choose 1-based layer numbers. This changes only the channel
+figure; all layers are still included in statistics and the original block figure.
+Neither optional argument requires editing the shell launcher. Undefined channel
+values are JSON `null` / empty CSV cells. Channel IDs are 0-based.
 
 Defaults are `--num-samples 16 --sequence-length 2048 --batch-size 4
 --tokens-per-sample 128 --seed 0 --device auto`. Original models use WikiText-2
