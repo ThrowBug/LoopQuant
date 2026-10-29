@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
+import math
 from typing import Any
 
 import yaml
@@ -60,13 +61,11 @@ DEFAULTS: dict[str, Any] = {
 }
 
 LOW_RANK_DEFAULTS = {
-    "sharing": "prefix",
+    "sharing": "independent",
     "rank_step": 16,
-    "gptq": {"hessian_mode": "mean_hessian", "damp_percent": 0.01,
-             "block_size": 128, "statistics_tokens_per_loop": None},
+    "solver": {"weight_update": "regression_gptq", "iterations": 3, "damp_percent": 0.01,
+               "loop_weights": None, "block_size": 128, "statistics_tokens_per_loop": None},
     "activation": {"clip_min": 0.5, "clip_max": 1.0, "clip_step": 0.01},
-    "optimization": {"enabled": True, "steps": 32, "learning_rate": 1e-3, "batch_size": 4,
-                     "gradient_clip": 1.0, "svd_iterations": 3},
     "rotation": {"enabled": False},
     "channel_scaling": {"enabled": False},
 }
@@ -196,29 +195,27 @@ class LoopQuantConfig:
             raise ValueError("rank_step must be a positive integer")
         if any(method[name]["enabled"] for name in ("rotation", "channel_scaling")):
             raise ValueError("low_rank rotation and channel_scaling are not implemented; keep enabled=false")
-        gptq = method["gptq"]
-        if gptq["hessian_mode"] not in {"mean_hessian", "mean_activation"}:
-            raise ValueError("hessian_mode must be mean_hessian or mean_activation")
-        if not 0 < float(gptq["damp_percent"]) < 1:
-            raise ValueError("GPTQ requires positive damping and block_size")
-        if not _positive_integer(gptq["block_size"]):
-            raise ValueError("GPTQ block_size must be a positive integer")
-        cap = gptq["statistics_tokens_per_loop"]
+        solver = method["solver"]
+        if solver["weight_update"] not in {"regression_gptq", "gptaq"}:
+            raise ValueError("solver.weight_update must be regression_gptq or gptaq")
+        if not _positive_integer(solver["iterations"]):
+            raise ValueError("solver.iterations must be a positive integer")
+        damp = solver["damp_percent"]
+        if isinstance(damp, bool) or not isinstance(damp, (int, float)) or not 0 < damp < 1:
+            raise ValueError("solver.damp_percent must lie in (0, 1)")
+        if not _positive_integer(solver["block_size"]):
+            raise ValueError("solver.block_size must be a positive integer")
+        weights = solver["loop_weights"]
+        if weights is not None and (not isinstance(weights, list) or len(weights) != self.num_loops
+                                   or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                                          or not math.isfinite(value) or value <= 0 for value in weights)):
+            raise ValueError("solver.loop_weights must be null or num_loops positive finite numbers")
+        cap = solver["statistics_tokens_per_loop"]
         if cap is not None and not _positive_integer(cap):
             raise ValueError("statistics_tokens_per_loop must be positive or null")
         act = method["activation"]
         if not 0 < act["clip_min"] <= act["clip_max"] <= 1 or act["clip_step"] <= 0:
             raise ValueError("activation clip grid must lie in (0, 1]")
-        options = method["optimization"]
-        if not isinstance(options["enabled"], bool):
-            raise ValueError("optimization.enabled must be a boolean")
-        if not _positive_integer(options["svd_iterations"]):
-            raise ValueError("optimization.svd_iterations must be positive")
-        if options["enabled"]:
-            if any(not _positive_integer(options[key]) for key in ("steps", "batch_size")):
-                raise ValueError("optimization steps and batch_size must be positive")
-            if options["learning_rate"] <= 0 or options["gradient_clip"] <= 0:
-                raise ValueError("optimization learning_rate and gradient_clip must be positive")
         cache_dir = self.calibration["cache_dir"]
         if not isinstance(cache_dir, str) or not cache_dir.strip():
             raise ValueError("calibration.cache_dir must be a nonempty directory path")

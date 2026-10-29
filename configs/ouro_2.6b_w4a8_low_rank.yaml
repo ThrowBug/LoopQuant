@@ -7,11 +7,10 @@ num_loops: 4
 quantization: {weight_bits: 4, group_size: 32, activation_setting: w4a8}
 calibration: {dataset: wikitext2, split: train, num_samples: 128, sequence_length: 2048, seed: 0, batch_size: 4, cache_dir: cache/calibration}
 method:
-  sharing: prefix
+  sharing: independent
   rank_step: 16
-  gptq: {hessian_mode: mean_hessian, damp_percent: 0.01, block_size: 128, statistics_tokens_per_loop: null}
+  solver: {weight_update: regression_gptq, iterations: 3, damp_percent: 0.01, loop_weights: null, block_size: 128, statistics_tokens_per_loop: null}
   activation: {clip_min: 0.5, clip_max: 1.0, clip_step: 0.01}
-  optimization: {enabled: true, steps: 32, learning_rate: 1.0e-3, batch_size: 4, gradient_clip: 1.0, svd_iterations: 3}
   rotation: {enabled: false}
   channel_scaling: {enabled: false}
 output_dir: outputs/ouro_2.6b_w4a8_low_rank

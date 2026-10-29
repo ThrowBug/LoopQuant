@@ -1,6 +1,7 @@
 """Low-rank structure metadata; shared checkpoint I/O preserves exact tensors."""
 
 from pathlib import Path
+from copy import deepcopy
 
 from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig
@@ -11,6 +12,21 @@ from .modules import LowRankLinear, wrap_linears, prepare_inference
 from .quantization import activation_bits
 
 
+def _checkpoint_config(values):
+    """Migrate obsolete fitting metadata only when reading old snapshots.
+
+    New quantization YAMLs remain strict. Saved Q/A/B and prefix inference do
+    not depend on the removed optimizer or on how the original Hessian was fit.
+    """
+    values = deepcopy(values)
+    method = values["method"]
+    if "solver" not in method and ("optimization" in method or "gptq" in method):
+        method.pop("optimization", None)
+        method.pop("gptq", None)
+        method.setdefault("sharing", "prefix")
+    return LoopQuantConfig.from_dict(values)
+
+
 def save_checkpoint(model, tokenizer, path, *, quantization_config=None, max_shard_bytes=1_000_000_000):
     from ..checkpoint import _runtime_state, _publish_checkpoint
     target = Path(path).expanduser().resolve()
@@ -18,7 +34,7 @@ def save_checkpoint(model, tokenizer, path, *, quantization_config=None, max_sha
         raise FileExistsError(f"checkpoint already exists: {target}")
     if max_shard_bytes <= 0:
         raise ValueError("max_shard_bytes must be positive")
-    config = LoopQuantConfig.from_dict(quantization_config or model._low_rank_config)
+    config = _checkpoint_config(quantization_config or model._low_rank_config)
     modules = [module for module in model.modules() if isinstance(module, LowRankLinear)]
     if not modules or any(module.num_loops != config.num_loops for module in modules):
         raise ValueError("low_rank structure does not match checkpoint configuration")
@@ -48,7 +64,7 @@ def save_checkpoint(model, tokenizer, path, *, quantization_config=None, max_sha
 
 
 def restore_structure(model, manifest):
-    config = LoopQuantConfig.from_dict(manifest["quantization_config"])
+    config = _checkpoint_config(manifest["quantization_config"])
     if config.algorithm != "low_rank" or config.num_loops != manifest["num_loops"]:
         raise ValueError("low_rank manifest and method configuration disagree")
     if [activation_bits(config)] * config.num_loops != manifest["allocation"]:

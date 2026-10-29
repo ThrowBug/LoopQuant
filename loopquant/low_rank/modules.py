@@ -1,4 +1,4 @@
-"""A fixed fake-quantized base plus separately trainable rank-k increments."""
+"""A shared fake-quantized base plus frozen per-loop low-rank factors."""
 
 from functools import wraps
 
@@ -15,8 +15,9 @@ class LowRankLinear(nn.Module):
     def __init__(self, linear, *, num_loops, rank_step, sharing, activation_bits, group_size=32):
         super().__init__()
         self.in_features, self.out_features = linear.in_features, linear.out_features
-        if num_loops * rank_step > min(self.in_features, self.out_features):
-            raise ValueError(f"rank_step*num_loops exceeds linear dimensions: {self.in_features}, {self.out_features}")
+        rank = num_loops * rank_step if sharing == "prefix" else rank_step
+        if rank > min(self.in_features, self.out_features):
+            raise ValueError(f"active rank exceeds linear dimensions: {self.in_features}, {self.out_features}")
         self.weight, self.bias = linear.weight, linear.bias
         self.weight.requires_grad_(False)
         if self.bias is not None:
@@ -49,9 +50,7 @@ class LowRankLinear(nn.Module):
     def forward_at_loop(self, value, loop):
         value = quantize_activation(value, self.activation_bits, self.group_size, self.clip_ratios[loop])
         a, b = self.factors(loop)
-        # Normalize GEMM layouts in training and inference, including mixed-dtype
-        # FP32 masters. Frozen inference prefixes are prepared contiguously once.
-        correction = F.linear(F.linear(value, a.to(value.dtype).contiguous()), b.to(value.dtype).contiguous())
+        correction = F.linear(F.linear(value, a.contiguous()), b.contiguous())
         return F.linear(value, self.weight, self.bias) + correction
 
     def forward(self, value):

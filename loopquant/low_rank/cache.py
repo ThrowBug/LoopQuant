@@ -17,7 +17,7 @@ from ..evaluation_results import save_json
 from ..data import tokenizer_fingerprint
 from .adapter import run_block
 from .modules import TARGETS
-from .quantization import activation_bits, fit_clip
+from .quantization import activation_bits, fit_clip, quantize_activation
 
 CACHE_VERSION = 1
 
@@ -206,65 +206,102 @@ def _save_stat(path, tensors, description):
 
 
 @torch.no_grad()
-def block_statistics(model, block_index, teacher, config, device):
-    options, act = config.method["gptq"], config.method["activation"]
-    bits = activation_bits(config)
-    cap, mode = options["statistics_tokens_per_loop"], options["hessian_mode"]
-    hdesc = {"version": CACHE_VERSION, "mode": mode, "tokens_per_loop": cap}
-    cdesc = {"version": CACHE_VERSION, "bits": bits, "group_size": config.quantization["group_size"],
-             "grid": act, "tokens_per_loop": cap}
-    hpath = teacher.directory / "hessian" / mode / fingerprint(hdesc) / f"block_{block_index:03d}.safetensors"
-    cpath = teacher.directory / "activation_clip" / fingerprint(cdesc) / f"block_{block_index:03d}.safetensors"
-    hessians, clips = _load_stat(hpath, hdesc), _load_stat(cpath, cdesc)
-    if hessians is not None and clips is not None:
-        return hessians, clips
+def _replay_teacher(model, block_index, teacher, config, device, observe):
+    """Replay only the FP block, with the original collection batch shapes."""
     block = model.model.layers[block_index]
-    modules = original_linears(block)
-    matrices = {name: torch.zeros(module.in_features, module.in_features, device=device)
-                for name, module in modules.items()} if hessians is None else None
-    count = int(round((act["clip_max"] - act["clip_min"]) / act["clip_step"])) + 1
-    ratios = [min(act["clip_max"], act["clip_min"] + i * act["clip_step"]) for i in range(count)]
-    if ratios[-1] < act["clip_max"] - 1e-8:
-        ratios.append(act["clip_max"])
-    errors = {name: torch.zeros(config.num_loops, len(ratios), device=device) for name in modules} if clips is None else None
-    values, handles = {}, []
-    for name, module in modules.items():
-        def hook(_module, args, key=name):
-            values[key] = args[0].detach().reshape(-1, args[0].shape[-1]).float()
-        handles.append(module.register_forward_pre_hook(hook))
-    total = 0
+    cap = config.method["solver"]["statistics_tokens_per_loop"]
+    batch_size = teacher.manifest.get("collection_batch_size", 1)
+    loop, total = 0, 0
+    handles = []
+    for name, module in original_linears(block).items():
+        def hook(linear, args, output, key=name):
+            value = args[0].detach().reshape(-1, linear.in_features)
+            target = output.detach().reshape(-1, linear.out_features)
+            stop = len(value) if cap is None else max(0, cap - total)
+            observe(key, linear, loop, value[:stop], target[:stop])
+        handles.append(module.register_forward_hook(hook))
     try:
-        for sample in range(teacher.manifest["num_samples"]):
-            if cap is not None and total >= cap:
-                break
-            loops = []
-            for loop in range(config.num_loops):
-                hidden = teacher.read(block_index, loop, sample)["input"].to(device)
+        for loop in range(config.num_loops):
+            total = 0
+            for start in range(0, teacher.manifest["num_samples"], batch_size):
+                if cap is not None and total >= cap:
+                    break
+                stop = min(start + batch_size, teacher.manifest["num_samples"])
+                hidden = torch.cat([teacher.read(block_index, loop, sample)["input"]
+                                    for sample in range(start, stop)]).to(device)
                 run_block(model, block, hidden, loop)
-                selected = {name: value[:max(0, cap - total)] if cap is not None else value
-                            for name, value in values.items()}
-                loops.append(selected)
-                if errors is not None:
-                    for name, value in selected.items():
-                        errors[name][loop] += fit_clip(value, bits, config.quantization["group_size"], ratios)
-            tokens = next(iter(loops[0].values())).shape[0]
-            total += tokens
-            if matrices is not None:
-                for name in modules:
-                    if mode == "mean_hessian":
-                        for current in loops:
-                            matrices[name].addmm_(current[name].T, current[name], alpha=1 / config.num_loops)
-                    else:
-                        average = torch.stack([current[name] for current in loops]).mean(0)
-                        matrices[name].addmm_(average.T, average)
+                total += hidden.numel() // hidden.shape[-1]
     finally:
         for handle in handles:
             handle.remove()
-    if matrices is not None:
-        hessians = {name: value.mul_(2 / max(total, 1)).cpu() for name, value in matrices.items()}
-        _save_stat(hpath, hessians, hdesc)
-    if errors is not None:
+
+
+@torch.no_grad()
+def block_statistics(model, block_index, teacher, config, device):
+    """Fixed clips and per-loop ZZ'/N, YZ'/N, ||Y||²/N, using actual FP Y."""
+    act = config.method["activation"]
+    bits, group = activation_bits(config), config.quantization["group_size"]
+    # Version 2 keeps activation rounding in the teacher/inference dtype. Old
+    # FP-X Hessians and FP32 clipping statistics cannot stand in for these Zs.
+    description = {"version": 2, "bits": bits, "group_size": group, "grid": act,
+                   "tokens_per_loop": config.method["solver"]["statistics_tokens_per_loop"]}
+    filename = f"block_{block_index:03d}.safetensors"
+    cpath = teacher.directory / "activation_clip" / fingerprint(description) / filename
+    clips = _load_stat(cpath, description)
+    modules = original_linears(model.model.layers[block_index])
+    if clips is None:
+        count = int(round((act["clip_max"] - act["clip_min"]) / act["clip_step"])) + 1
+        ratios = [min(act["clip_max"], act["clip_min"] + i * act["clip_step"]) for i in range(count)]
+        if ratios[-1] < act["clip_max"] - 1e-8:
+            ratios.append(act["clip_max"])
+        errors = {name: torch.zeros(config.num_loops, len(ratios), device=device) for name in modules}
+
+        def collect_clip(name, module, loop, value, target):
+            errors[name][loop] += fit_clip(value, bits, group, ratios)
+
+        _replay_teacher(model, block_index, teacher, config, device, collect_clip)
         grid = torch.tensor(ratios, device=device)
         clips = {name: grid[value.argmin(-1)].cpu() for name, value in errors.items()}
-        _save_stat(cpath, clips, cdesc)
-    return hessians, clips
+        _save_stat(cpath, clips, description)
+        del errors
+
+    description = {**description, "clips": {name: value.tolist() for name, value in clips.items()},
+                   "target": "fp_linear_output_without_bias", "accumulation_dtype": "float32"}
+    path = teacher.directory / "linear_statistics" / fingerprint(description) / filename
+    cached = _load_stat(path, description)
+    fields = ("hessian", "cross", "target_energy", "num_tokens")
+    if cached is not None:
+        return {name: {field: cached[f"{name}.{field}"] for field in fields} for name in modules}, clips
+
+    loops = config.num_loops
+    statistics = {name: {
+        "hessian": torch.zeros(loops, module.in_features, module.in_features, device=device),
+        "cross": torch.zeros(loops, module.out_features, module.in_features, device=device),
+        "target_energy": torch.zeros(loops, device=device, dtype=torch.float64),
+        "num_tokens": torch.zeros(loops, device=device, dtype=torch.int64),
+    } for name, module in modules.items()}
+    device_clips = {name: value.to(device) for name, value in clips.items()}
+
+    def collect_statistics(name, module, loop, value, target):
+        z = quantize_activation(value, bits, group, device_clips[name][loop]).float()
+        y = target.float()
+        if module.bias is not None:
+            y = y - module.bias.float()
+        current = statistics[name]
+        current["hessian"][loop].addmm_(z.T, z)
+        current["cross"][loop].addmm_(y.T, z)
+        current["target_energy"][loop] += y.square().sum(dtype=torch.float64)
+        current["num_tokens"][loop] += len(z)
+
+    _replay_teacher(model, block_index, teacher, config, device, collect_statistics)
+    for current in statistics.values():
+        counts = current["num_tokens"]
+        if (counts == 0).any():
+            raise ValueError("no calibration tokens collected for a loop")
+        current["hessian"] /= counts[:, None, None]
+        current["cross"] /= counts[:, None, None]
+        current["target_energy"] /= counts
+    flat = {f"{name}.{field}": value.cpu() for name, current in statistics.items()
+            for field, value in current.items()}
+    _save_stat(path, flat, description)
+    return {name: {field: flat[f"{name}.{field}"] for field in fields} for name in modules}, clips

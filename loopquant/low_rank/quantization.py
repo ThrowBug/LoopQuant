@@ -1,4 +1,4 @@
-"""Standalone symmetric G32 fake quantization and GPTQ initialization."""
+"""Standalone symmetric G32 fake quantization and GPTQ weight updates."""
 
 import torch
 
@@ -6,10 +6,6 @@ import torch
 def activation_bits(config):
     """Use one activation precision for every projection and loop."""
     return {"w4a4": 4, "w4a8": 8}[config.quantization["activation_setting"].lower()]
-
-
-def round_ste(value):
-    return value + (value.round() - value).detach()
 
 
 def quantize_activation(value, bits, group_size=32, clip=1.0):
@@ -20,7 +16,7 @@ def quantize_activation(value, bits, group_size=32, clip=1.0):
     grouped = value.float().reshape(*value.shape[:-1], -1, group_size)
     maximum = 2 ** (int(bits) - 1) - 1
     scale = grouped.abs().amax(-1, keepdim=True).clamp_min(1e-8) * clip / maximum
-    result = round_ste(grouped / scale).clamp(-maximum, maximum) * scale
+    result = (grouped / scale).round().clamp(-maximum, maximum) * scale
     return result.reshape_as(value).to(value.dtype)
 
 
@@ -30,16 +26,22 @@ def fit_clip(value, bits, group_size, ratios):
 
 
 @torch.no_grad()
-def gptq(weight, hessian, *, bits=4, group_size=32, block_size=128, damp_percent=0.01):
+def gptq(weight, hessian, *, bits=4, group_size=32, block_size=128, damp_percent=0.01,
+         inverse_factor=None):
     """Quantize one shared matrix; caller defines the multi-loop Hessian."""
     work = weight.detach().float().clone()
-    hessian = hessian.to(device=work.device, dtype=torch.float32).clone()
-    dead = hessian.diag() == 0
-    work[:, dead] = 0
-    hessian[dead, dead] = 1
-    diagonal = torch.arange(work.shape[1], device=work.device)
-    hessian[diagonal, diagonal] += damp_percent * hessian.diag().mean()
-    inverse = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(hessian)), upper=True)
+    if inverse_factor is None:
+        hessian = hessian.to(device=work.device, dtype=torch.float32).clone()
+        dead = hessian.diag() == 0
+        work[:, dead] = 0
+        hessian[dead, dead] = 1
+        diagonal = torch.arange(work.shape[1], device=work.device)
+        hessian[diagonal, diagonal] += damp_percent * hessian.diag().mean()
+        inverse = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(hessian)), upper=True)
+    else:
+        # The alternating solver reuses the already regularized factor. Do not
+        # add damping again or erase columns using a different dead-channel rule.
+        inverse = inverse_factor
     result = torch.empty_like(work)
     qmax = 2 ** (bits - 1) - 1
     scale = None

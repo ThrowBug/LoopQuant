@@ -605,63 +605,78 @@ supply a matching `--num-loops`. Low-rank vLLM currently uses `cached` execution
 original LoopQuant `compiled`/`fast` modes are not enabled for this new method.
 No dependency changes or low-bit kernels are required for this path.
 
-Each of the seven attention/MLP projections contains one fixed GPTQ W4/G32 base
-plus rank-k increments. `method.rank_step` is k and `num_loops` is T.
-`method.sharing: prefix` activates cumulative ranks k, 2k, ..., Tk;
-`independent` activates a separate rank-k pair in each loop. Both store
-Tk(m+n) low-rank parameters for a matrix of shape (m,n), with equal factor dtype.
-The prefix version performs (T+1)/2 times as much low-rank branch work across all
-loops; equal storage does not imply equal compute. Embeddings, LM head, norms
-and biases retain their original floating precision and are frozen.
+Each of the seven attention/MLP projections contains one shared W4/G32 base Q
+and an independent rank-k pair B_t A_t for each loop. `method.rank_step` is k;
+`num_loops` is T, with Tk(m+n) low-rank parameters for a matrix of shape (m,n).
+Embeddings, LM head, norms and biases retain their original floating precision.
 
-Initialization and reconstruction are separate:
+The fitter minimizes the weighted sum of linear-output reconstruction errors
+`||(Q + B_t A_t) Z_t - Y_t||² / N_t`. X_t and Y_t come from the FP teacher;
+Z_t is the fake-quantized/dequantized X_t using a fixed, offline-searched clip.
+Bias is subtracted from Y_t when present. This is a per-Linear objective, not
+decoder-block reconstruction or end-to-end training.
 
-1. Cache the original FP teacher trajectories and original projection weights.
-2. Initialize each shared base once with GPTQ. `method.gptq.hessian_mode` selects
-   `mean_hessian` (average per-loop input Grams) or `mean_activation` (Gram of
-   aligned mean inputs). This stage uses FP teacher inputs.
-3. Fit fixed per-module/per-loop activation clipping on teacher activations using
-   MSE over the configured grid. Quantization is dynamic symmetric G32, with
-   integer range [-7,7] for A4 or [-127,127] for A8. Both base and correction consume the same
-   dequantized activation; the correction is not requantized.
-4. Train loop 1 through T, visiting every decoder block in order. Only the current
-   rank-k increments inside that block are trainable. Initialize from a truncated
-   SVD of the remaining weight error, then use normalized block-output MSE against
-   the cached FP teacher. Student inputs come from completed student computations.
-   Freeze the increment, update student outputs, and apply the original final
-   norm at every loop boundary. There is no base-weight alternating update or
-   end-to-end fine-tuning. Activation rounding uses an STE inside the current block.
+1. Cache immutable FP teacher trajectories and original projection weights.
+2. Fit per-module/per-loop clipping by activation MSE. Activation quantization
+   remains dynamic symmetric G32: [-7,7] for A4 or [-127,127] for A8. Both the
+   base and low-rank branch consume the same Z_t; the correction is not requantized.
+3. Replay each unmodified FP block with the original teacher collection batch
+   shapes; collect H_t=Z_t Z_t'/N_t, D_t=Y_t Z_t'/N_t and ||Y_t||²/N_t in FP32
+   (energy reductions use FP64). Rounding uses the original activation dtype.
+4. Start with all low-rank factors zero. With the factors fixed, solve the shared
+   continuous regression, then quantize that solution with GPTQ using the Gram
+   of Z. With Q fixed, whiten each loop's residual cross moment and use exact
+   truncated SVD to solve the regularized rank-k problem.
+5. Repeat complete Q/low-rank rounds, retaining the full Q/A/B combination with
+   the lowest original, unregularized reconstruction error. Stop if a round does
+   not improve it. Factors and the base are evaluated in their saved dtype;
+   this linear statistical objective does not simulate intermediate BF16 GEMM
+   rounding or account for upstream student-state drift.
 
-`method.optimization` controls steps **per block per loop**, learning rate, batch
-size and gradient clipping. Its initial defaults (32 steps, 1e-3, batch size 4)
-are starting settings, not validated Ouro hyperparameters. Set
-`method.optimization.enabled: false` for initialization only: each rank-k increment
-is initialized by the same residual SVD, frozen in the base dtype, and used to
-refresh student states in the original loop/block order. No optimizer or backward
-pass runs. Both `prefix` and `independent` support this mode. Training-only options
-are ignored, while `svd_iterations` still controls initialization. Run summaries
-report zero optimization steps and null losses for this mode.
-
-The switch defaults to true when absent, preserving old YAML and checkpoint
-loading behavior. It does not change teacher/Hessian/clip cache keys, checkpoint
-format, inference structure or shell commands. For example, keep the remaining
-optimization options and change only:
+The old ordinary residual-SVD initialization, block Adam training, STE and
+temporary student-state propagation have been removed. The new configuration is:
 
 ```yaml
 method:
-  optimization:
-    enabled: false
+  sharing: independent
+  rank_step: 16
+  solver:
+    weight_update: regression_gptq
+    iterations: 3
+    damp_percent: 0.01
+    loop_weights: null
+    block_size: 128
+    statistics_tokens_per_loop: null
 ```
 
-All calibration tokens are eligible for fitting; `statistics_tokens_per_loop: null` uses all tokens for
-Hessian/clip statistics. A positive cap takes the same deterministic token prefix
-in each loop and changes the statistics cache key. Activation precision is uniform
+`iterations: 1` performs one Q update followed by one weighted low-rank fit.
+Three rounds are a starting setting, not a validated Ouro optimum. `loop_weights`
+is null for equal weights or a positive list of length T; weights are normalized.
+`block_size` is the GPTQ processing width, not quantization group size.
+
+The relative ridge is `rho = damp_percent * mean(diag(H))`, computed separately
+for the shared Gram and each loop Gram (diagonal means have a 1e-8 numerical
+floor for zero inputs). The default 0.01 follows GPTQ's relative damping setting.
+Regression solves and whitening include this ridge; GPTQ reuses the resulting
+inverse factor without adding damping twice. The reported loss excludes ridge,
+so a worsening complete round is rejected. Exact SVD avoids optimization-step
+hyperparameters but can be expensive for large projections.
+
+`sharing: prefix` and `solver.weight_update: gptaq` are reserved; selecting them
+for quantization fails before collecting a teacher cache. Old prefix checkpoints
+still load for HF and vLLM inference. Old quantization YAMLs must be migrated to
+the new fields; old checkpoint optimizer metadata is migrated only during loading.
+The former `hessian_mode: mean_activation` ablation is not part of this objective.
+
+All calibration tokens are eligible; `statistics_tokens_per_loop: null` uses all
+tokens for clip and linear statistics. A cap takes the same deterministic token
+prefix in each loop and changes the statistics key. Activation precision is uniform
 across all projections and loops: `w4a4` uses A4 and `w4a8` uses A8. Low-rank
 configurations do not accept per-loop bit plans and never run ILPA.
 `rotation.enabled` and `channel_scaling.enabled` are reserved and must remain false.
 
-`calibration.batch_size` controls FP teacher collection independently of
-`method.optimization.batch_size`; its default is 4. Collection batches equal-length
+`calibration.batch_size` controls FP teacher collection; its default is 4.
+Collection batches equal-length
 sequences, retains the original per-sample cache layout, and overlaps bounded
 background disk writes/checksums with forward execution. GPU-to-CPU snapshots
 remain synchronous. On Ouro, only the final token's unused vocabulary logits are
@@ -681,23 +696,26 @@ cache/calibration/
     tokens.safetensors
     teacher/block_000/weights.safetensors
     teacher/block_000/loop_00/shard_00000.safetensors
-    hessian/<mean_hessian|mean_activation>/<statistics_key>/block_000.safetensors
     activation_clip/<clip_key>/block_000.safetensors
+    linear_statistics/<statistics_key>/block_000.safetensors
 ```
 
 Teacher keys include original weights, actual token IDs, tokenizer, source code,
 model configuration, loop count and precision. They do not include ranks,
-sharing or optimization settings. Derived statistics have their own keys and
-checksums. Teacher inputs/outputs retain their dtype and are streamed to disk;
-full trajectories can require substantial disk space. Temporary student states
-are removed after training. Neither training caches nor the original weights are
+sharing or solver settings. Derived statistics have their own keys and
+checksums, including activation bits, clipping and token selection. They can be
+reused when ranks, loop weights, damping or alternating rounds change. Old FP-X
+Hessians and old FP32 clip statistics are not reused as Z-based statistics.
+Teacher inputs/outputs retain their dtype and are streamed to disk;
+full trajectories and per-loop Grams can require substantial disk space.
+Neither calibration caches nor the original weights are
 needed to load a finished checkpoint.
 
 Snapshots go to `output_dir/checkpoint` before evaluation. Their manifest
 identifies `low-rank-fake-quantized` format version 1, factor layout and loop plan;
 HF and vLLM dispatch to the correct restorer automatically. The saved weights
 are floating fake-quantized tensors, not packed INT4. Use distinct config filenames
-or `quantize.sh --tag` values for sharing/Hessian ablations. Existing LoopQuant
+or `quantize.sh --tag` values for solver/rank ablations. Existing LoopQuant
 snapshots remain valid and can be loaded by the direct CLI at their original paths.
 
 ## License

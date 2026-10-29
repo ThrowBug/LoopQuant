@@ -1,4 +1,4 @@
-"""Low-rank algorithm, recurrent freezing, cache and checkpoint contracts."""
+"""Low-rank configuration, immutable teacher cache and checkpoint contracts."""
 
 import importlib
 import json
@@ -20,7 +20,6 @@ from loopquant.low_rank.cache import prepare_teacher_cache, block_statistics
 from loopquant.low_rank.modules import LowRankLinear, iter_linears, wrap_linears, prepare_inference
 from loopquant.low_rank.pipeline import LowRankPipeline
 from loopquant.low_rank.quantization import quantize_activation
-from loopquant.low_rank.reconstruction import initialize_increment
 from loopquant.models import configure_looped_model, load_model_for_evaluation
 from modeling_tiny_ouro import TinyOuroConfig, TinyOuroForCausalLM
 from modeling_paged_ouro import PagedOuroConfig, PagedOuroForCausalLM
@@ -28,14 +27,13 @@ from test_evaluation import tiny_model_and_tokenizer
 from test_vllm import bridge_module
 
 
-def configuration(tmp_path, *, loops=2, sharing="prefix", mode="mean_hessian", setting="w4a4", optimize=True):
+def configuration(tmp_path, *, loops=2, sharing="independent", setting="w4a4", iterations=2):
     return LoopQuantConfig.from_dict({
         "algorithm": "low_rank", "num_loops": loops, "model_key": "tiny",
         "quantization": {"activation_setting": setting},
         "calibration": {"cache_dir": str(tmp_path / "cache"), "num_samples": 2, "sequence_length": 3},
-        "method": {"sharing": sharing, "rank_step": 2, "gptq": {"hessian_mode": mode},
-                   "activation": {"clip_min": 0.8, "clip_max": 1.0, "clip_step": 0.1},
-                   "optimization": {"enabled": optimize, "steps": 3, "learning_rate": 0.01}},
+        "method": {"sharing": sharing, "rank_step": 2, "solver": {"iterations": iterations},
+                   "activation": {"clip_min": 0.8, "clip_max": 1.0, "clip_step": 0.1}},
     })
 
 
@@ -69,13 +67,13 @@ def test_config_uses_configured_loops_and_equal_storage(tmp_path, loops, sharing
 
 @pytest.mark.parametrize("update", [
     {"sharing": "typo"}, {"rank_step": 0}, {"rotation": {"enabled": True}},
-    {"channel_scaling": {"enabled": True}}, {"gptq": {"hessian_mode": "hessian_of_mean"}},
+    {"channel_scaling": {"enabled": True}}, {"solver": {"iterations": 0}},
     {"activation_bits": [4, 8]}, {"activation_bits": 6}, {"optimization": {"steps": 0}},
 ])
 def test_invalid_method_options_are_rejected(tmp_path, update):
     values = configuration(tmp_path).to_dict()
     for key, value in update.items():
-        if isinstance(value, dict):
+        if isinstance(value, dict) and key in values["method"]:
             values["method"][key].update(value)
         else:
             values["method"][key] = value
@@ -83,31 +81,101 @@ def test_invalid_method_options_are_rejected(tmp_path, update):
         LoopQuantConfig.from_dict(values)
 
 
-def test_old_configs_default_to_enabled_optimization(tmp_path):
+@pytest.mark.parametrize("options", [
+    {"weight_update": "typo"}, {"iterations": False}, {"iterations": 1.5},
+    {"damp_percent": 0}, {"damp_percent": float("nan")}, {"damp_percent": True},
+    {"loop_weights": [1]}, {"loop_weights": [1, 0]}, {"loop_weights": [1, float("inf")]},
+    {"loop_weights": [1, True]}, {"loop_weights": "equal"}, {"block_size": 0},
+    {"statistics_tokens_per_loop": False},
+])
+def test_invalid_solver_options(tmp_path, options):
     values = configuration(tmp_path).to_dict()
-    values["method"]["optimization"].pop("enabled")
+    values["method"]["solver"].update(options)
+    with pytest.raises(ValueError):
+        LoopQuantConfig.from_dict(values)
+
+
+@pytest.mark.parametrize("reserved", [{"sharing": "prefix"}, {"solver": {"weight_update": "gptaq"}}])
+def test_reserved_solvers_fail_before_collecting_teacher(tmp_path, monkeypatch, reserved):
+    import loopquant.low_rank.pipeline as pipeline
+    values = configuration(tmp_path).to_dict()
+    for key, value in reserved.items():
+        if isinstance(value, dict):
+            values["method"][key].update(value)
+        else:
+            values["method"][key] = value
     config = LoopQuantConfig.from_dict(values)
-    assert config.method["optimization"]["enabled"] is True
-    assert config.method["optimization"]["steps"] == 3
-    values["method"]["optimization"] = {"enabled": False}
-    assert LoopQuantConfig.from_dict(values).method["optimization"]["enabled"] is False
+    monkeypatch.setattr(pipeline, "prepare_teacher_cache", lambda *a, **kw: pytest.fail("collected teacher"))
+    model, tokenizer = tiny()
+    with pytest.raises(NotImplementedError, match="reserved"):
+        LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
 
 
-@pytest.mark.parametrize("value", ["false", 0, None])
-def test_optimization_switch_requires_a_boolean(tmp_path, value):
-    values = configuration(tmp_path).to_dict()
-    values["method"]["optimization"]["enabled"] = value
-    with pytest.raises(ValueError, match="optimization.enabled"):
-        LoopQuantConfig.from_dict(values)
+def test_independent_rank_is_not_multiplied_by_loop_count():
+    linear = torch.nn.Linear(32, 32, bias=False)
+    LowRankLinear(linear, num_loops=4, rank_step=16, sharing="independent", activation_bits=4)
+    with pytest.raises(ValueError, match="active rank"):
+        LowRankLinear(linear, num_loops=4, rank_step=16, sharing="prefix", activation_bits=4)
 
 
-def test_disabled_optimization_ignores_training_options_but_validates_svd(tmp_path):
-    values = configuration(tmp_path, optimize=False).to_dict()
-    values["method"]["optimization"].update(steps=0, learning_rate=0, batch_size=0, gradient_clip=0)
-    assert LoopQuantConfig.from_dict(values).method["optimization"]["enabled"] is False
-    values["method"]["optimization"]["svd_iterations"] = 0
-    with pytest.raises(ValueError, match="svd_iterations"):
-        LoopQuantConfig.from_dict(values)
+def test_linear_statistics_use_quantized_inputs_actual_teacher_and_fixed_clips(tmp_path, monkeypatch):
+    import loopquant.low_rank.cache as caching
+    model, tokenizer = tiny(layers=1)
+    # Include bias subtraction in the regression target contract.
+    projection = model.model.layers[0].self_attn.q_proj
+    projection.bias = torch.nn.Parameter(torch.linspace(-0.1, 0.1, 32).to(torch.bfloat16))
+    config = configuration(tmp_path)
+    teacher = prepare_teacher_cache(model, tokenizer, DATA, config, "cpu", logging.getLogger())
+    stats, clips = block_statistics(model, 0, teacher, config, "cpu")
+    seen = []
+    handle = projection.register_forward_hook(lambda module, args, y: seen.append((args[0].clone(), y.clone())))
+    for loop in range(config.num_loops):
+        hidden = torch.cat([teacher.read(0, loop, sample)["input"] for sample in range(2)])
+        run_block(model, model.model.layers[0], hidden, loop)
+    handle.remove()
+    current = stats["self_attn.q_proj"]
+    for loop, (x, y) in enumerate(seen):
+        z = quantize_activation(x, 4, clip=clips["self_attn.q_proj"][loop]).reshape(-1, 32).float()
+        y = y.reshape(-1, 32).float() - projection.bias.float()
+        torch.testing.assert_close(current["hessian"][loop], z.T @ z / 6)
+        torch.testing.assert_close(current["cross"][loop], y.T @ z / 6)
+        torch.testing.assert_close(current["target_energy"][loop], y.square().sum(dtype=torch.float64) / 6)
+    assert current["num_tokens"].tolist() == [6, 6]
+    config.method["solver"]["statistics_tokens_per_loop"] = 4
+    capped, _ = block_statistics(model, 0, teacher, config, "cpu")
+    assert capped["self_attn.q_proj"]["num_tokens"].tolist() == [4, 4]
+    config.method["solver"]["statistics_tokens_per_loop"] = None
+    config.quantization["activation_setting"] = "w4a8"
+    stats8, _ = block_statistics(model, 0, teacher, config, "cpu")
+    assert not torch.equal(stats8["self_attn.q_proj"]["hessian"], current["hessian"])
+    # Rank, weights, damping and alternating rounds do not change fixed data.
+    config.quantization["activation_setting"] = "w4a4"
+    config.method["rank_step"] = 3
+    config.method["solver"].update(iterations=5, damp_percent=0.02, loop_weights=[1, 2])
+    repeat = prepare_teacher_cache(model, tokenizer, DATA, config, "cpu", logging.getLogger())
+    assert repeat.hit and repeat.directory == teacher.directory
+    monkeypatch.setattr(caching, "run_block", lambda *a, **kw: pytest.fail("statistics cache not reused"))
+    cached, cached_clips = block_statistics(model, 0, teacher, config, "cpu")
+    for field in current:
+        assert torch.equal(cached["self_attn.q_proj"][field], current[field])
+    assert torch.equal(cached_clips["self_attn.q_proj"], clips["self_attn.q_proj"])
+
+
+def test_alternating_pipeline_never_runs_backward_or_an_optimizer(tmp_path, monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("alternating closed-form solver must not train with gradients")
+    monkeypatch.setattr(torch.optim, "Adam", forbidden)
+    monkeypatch.setattr(torch.Tensor, "backward", forbidden)
+    config = configuration(tmp_path, loops=3, iterations=3)
+    model, tokenizer = tiny(loops=3, layers=1)
+    result = LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
+    assert result.summary["rank_schedule"] == [2, 2, 2]
+    records = result.stage_summaries["low_rank_solver"]["linears"]
+    assert len(records) == 7
+    for record in records:
+        accepted = [step["loss"] for step in record["iterations"] if step["accepted"]]
+        assert accepted == sorted(accepted, reverse=True)
+        assert record["final_loss"] == min(step["loss"] for step in record["iterations"])
 
 
 @pytest.mark.parametrize("setting,bits", [("w4a4", 4), ("w4a8", 8)])
@@ -132,83 +200,13 @@ def test_activation_precision_is_uniform_across_projections_and_loops(tmp_path, 
 
 
 @pytest.mark.parametrize("bits", [4, 8])
-def test_activation_quantization_is_token_group_symmetric_and_differentiable(bits):
-    values = torch.linspace(-2, 3, 64).reshape(2, 32).requires_grad_()
+def test_activation_quantization_is_token_group_symmetric(bits):
+    values = torch.linspace(-2, 3, 64).reshape(2, 32)
     result = quantize_activation(values, bits, clip=0.8)
     maximum = 2 ** (bits - 1) - 1
     scales = values.detach().abs().amax(-1, keepdim=True) * 0.8 / maximum
     expected = (values.detach() / scales).round().clamp(-maximum, maximum) * scales
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
-    result.square().sum().backward()
-    assert torch.isfinite(values.grad).all() and values.grad.abs().sum() > 0
-
-
-@pytest.mark.parametrize("sharing", ["prefix", "independent"])
-def test_only_new_increment_changes_and_prior_loop_is_identical(sharing):
-    torch.manual_seed(13)
-    original = torch.nn.Linear(32, 32, bias=False).to(torch.bfloat16)
-    module = LowRankLinear(original, num_loops=3, rank_step=2, sharing=sharing,
-                           activation_bits=4)
-    reference = original.weight.detach().clone()
-    module.weight.data = quantize_activation(module.weight, 4)
-    initialize_increment(module, reference, 0, seed=0, iterations=2)
-    for bank in (module.A, module.B):
-        bank[0].requires_grad_(False)
-    values = torch.randn(2, 3, 32).to(torch.bfloat16)
-    before = module.forward_at_loop(values, 0).detach().clone()
-    old = [p.detach().clone() for bank in (module.A, module.B) for p in bank[:1]]
-    initialize_increment(module, reference, 1, seed=1, iterations=2)
-    optimizer = torch.optim.AdamW([module.A[1], module.B[1]], lr=0.1, weight_decay=0.1)
-    loss = module.forward_at_loop(values, 1).float().square().mean()
-    loss.backward()
-    optimizer.step()
-    assert all(torch.equal(a, b) for a, b in zip(old, [module.A[0], module.B[0]]))
-    torch.testing.assert_close(module.forward_at_loop(values, 0), before, rtol=0, atol=0)
-
-
-def test_teacher_cache_and_hessian_modes_match_independent_formulas(tmp_path, monkeypatch):
-    import loopquant.low_rank.cache as caching
-    model, tokenizer = tiny(layers=1)
-    config = configuration(tmp_path)
-    teacher = prepare_teacher_cache(model, tokenizer, DATA, config, "cpu", logging.getLogger())
-    assert not teacher.hit
-    repeat = prepare_teacher_cache(model, tokenizer, DATA, config, "cpu", logging.getLogger())
-    assert repeat.hit and repeat.directory == teacher.directory
-    block = model.model.layers[0]
-    seen = []
-    handle = block.self_attn.q_proj.register_forward_pre_hook(lambda module, args: seen.append(args[0].float().reshape(-1, 32)))
-    for sample in range(2):
-        for loop in range(2):
-            run_block(model, block, teacher.read(0, loop, sample)["input"], loop)
-    handle.remove()
-    expected_mean_hessian = sum(x.T @ x for x in seen) / 6
-    expected_mean_activation = sum(((seen[i] + seen[i + 1]) / 2).T @ ((seen[i] + seen[i + 1]) / 2)
-                                   for i in (0, 2)) / 3
-    h1, clip1 = block_statistics(model, 0, teacher, config, "cpu")
-    torch.testing.assert_close(h1["self_attn.q_proj"], expected_mean_hessian)
-    config.method["gptq"]["hessian_mode"] = "mean_activation"
-    h2, clip2 = block_statistics(model, 0, teacher, config, "cpu")
-    torch.testing.assert_close(h2["self_attn.q_proj"], expected_mean_activation)
-    assert not torch.equal(h1["self_attn.q_proj"], h2["self_attn.q_proj"])
-    assert all(torch.equal(clip1[name], clip2[name]) for name in clip1)
-    clip_bits = []
-    original_fit_clip = caching.fit_clip
-
-    def record_clip(value, bits, group_size, ratios):
-        clip_bits.append(bits)
-        return original_fit_clip(value, bits, group_size, ratios)
-
-    monkeypatch.setattr(caching, "fit_clip", record_clip)
-    config.quantization["activation_setting"] = "w4a8"
-    h8, _ = block_statistics(model, 0, teacher, config, "cpu")
-    assert clip_bits and set(clip_bits) == {8}
-    assert all(torch.equal(h2[name], h8[name]) for name in h2)
-    assert len(list((teacher.directory / "activation_clip").glob("*/block_000.safetensors"))) == 2
-    config.method["optimization"]["enabled"] = False
-    disabled = prepare_teacher_cache(model, tokenizer, DATA, config, "cpu", logging.getLogger())
-    assert disabled.hit and disabled.directory == teacher.directory
-    monkeypatch.setattr(caching, "run_block", lambda *a, **kw: pytest.fail("statistics cache was not reused"))
-    block_statistics(model, 0, teacher, config, "cpu")
 
 
 def test_teacher_cache_invalidates_changed_tokens_and_weights(tmp_path):
@@ -310,18 +308,16 @@ def test_teacher_collection_requires_positive_integer_batch_size(tmp_path, batch
         LoopQuantConfig.from_dict(values)
 
 
-@pytest.mark.parametrize("sharing,mode", [("prefix", "mean_hessian"), ("independent", "mean_activation")])
 @pytest.mark.parametrize("setting,bits", [("w4a4", 4), ("w4a8", 8)])
-@pytest.mark.parametrize("optimize", [True, False])
-def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, sharing, mode, setting, bits, optimize):
+def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, setting, bits):
     model, tokenizer = tiny()
-    config = configuration(tmp_path, sharing=sharing, mode=mode, setting=setting, optimize=optimize)
+    config = configuration(tmp_path, setting=setting)
     frozen = {name: parameter.detach().clone() for name, parameter in model.named_parameters()
               if parameter.ndim == 1 or name.startswith(("model.embed_tokens", "lm_head"))}
     result = LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
-    assert result.summary["optimization_enabled"] is optimize
+    assert result.summary["weight_update"] == "regression_gptq"
     assert result.summary["activation_allocation"] == [bits, bits]
-    assert result.summary["rank_schedule"] == ([2, 4] if sharing == "prefix" else [2, 2])
+    assert result.summary["rank_schedule"] == [2, 2]
     assert not any(p.requires_grad for p in result.model.parameters())
     for name, value in frozen.items():
         assert torch.equal(value, dict(model.named_parameters())[name]), name
@@ -332,13 +328,9 @@ def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, sharing, m
     save_quantized_checkpoint(model, tokenizer, checkpoint, quantization_config=config.to_dict(), max_shard_bytes=15000)
     manifest_path = checkpoint / "checkpoint_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["quantization_config"]["method"]["optimization"]["enabled"] is optimize
-    if optimize:
-        # Older snapshots omitted the switch; restore their exact saved tensors.
-        manifest["quantization_config"]["method"]["optimization"].pop("enabled")
-        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    assert manifest["quantization_config"]["method"]["solver"]["weight_update"] == "regression_gptq"
     restored, _ = load_quantized_checkpoint(checkpoint, device="cpu", num_loops=2)
-    assert restored._low_rank_config["method"]["optimization"]["enabled"] is optimize
+    assert restored._low_rank_config["method"]["solver"]["iterations"] == 2
     assert restored._loopquant_allocation == (bits, bits)
     assert all(module.activation_bits == bits for block in restored.model.layers for _, module in iter_linears(block))
     assert all(torch.equal(value, restored.state_dict()[name]) for name, value in model.state_dict().items())
@@ -365,14 +357,13 @@ def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, sharing, m
 
 @pytest.mark.parametrize("sharing", ["prefix", "independent"])
 @pytest.mark.parametrize("setting,bits", [("w4a4", 4), ("w4a8", 8)])
-@pytest.mark.parametrize("optimize", [True, False])
-def test_low_rank_vllm_prefill_decode_and_method_dispatch(tmp_path, bridge_module, monkeypatch, sharing, setting, bits, optimize):
+def test_low_rank_vllm_prefill_decode_and_method_dispatch(tmp_path, bridge_module, monkeypatch, sharing, setting, bits):
     import loopquant.vllm_backend as backend
     from loopquant.evaluation_config import resolve_evaluation_config
     monkeypatch.delitem(sys.modules, "loopquant.low_rank.vllm_model", raising=False)
     bridge_class = importlib.import_module("loopquant.low_rank.vllm_model").LowRankOuroForCausalLM
     torch.manual_seed(89)
-    config = configuration(tmp_path, loops=3, sharing=sharing, setting=setting, optimize=optimize)
+    config = configuration(tmp_path, loops=3, sharing=sharing, setting=setting)
     model = PagedOuroForCausalLM(PagedOuroConfig(num_hidden_layers=2, total_ut_steps=3)).to(torch.bfloat16).eval()
     configure_looped_model(model, 3, quantization_hooks=False)
     wrap_linears(model, config)
@@ -390,6 +381,22 @@ def test_low_rank_vllm_prefill_decode_and_method_dispatch(tmp_path, bridge_modul
     _, tokenizer = tiny_model_and_tokenizer()
     snapshot = tmp_path / "loopquant"
     save_quantized_checkpoint(model, tokenizer, snapshot)
+    if sharing == "prefix":
+        # Old prefix snapshots remain usable without restoring the deleted fitter.
+        manifest_path = snapshot / "checkpoint_manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        method = manifest["quantization_config"]["method"]
+        method.pop("solver")
+        method["gptq"] = {"hessian_mode": "mean_activation", "damp_percent": 0.01,
+                          "block_size": 128, "statistics_tokens_per_loop": None}
+        method["optimization"] = {"enabled": False, "steps": 32, "learning_rate": 0.001,
+                                  "batch_size": 4, "gradient_clip": 1.0, "svd_iterations": 3}
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        restored, _ = load_quantized_checkpoint(snapshot, device="cpu", num_loops=3)
+        assert restored._low_rank_config["method"]["sharing"] == "prefix"
+        assert "optimization" not in restored._low_rank_config["method"]
+        with torch.no_grad():
+            torch.testing.assert_close(restored(DATA).logits, model(DATA).logits, rtol=0, atol=0)
     engine = SimpleNamespace(parallel_config=SimpleNamespace(tensor_parallel_size=1, pipeline_parallel_size=1),
                              quant_config=None, model_config=SimpleNamespace(model=str(snapshot), dtype=torch.bfloat16),
                              cache_config=None, device_config=SimpleNamespace(device="cpu"))
@@ -409,84 +416,6 @@ def test_low_rank_vllm_prefill_decode_and_method_dispatch(tmp_path, bridge_modul
     monkeypatch.setenv("LOOPQUANT_VLLM_EXECUTION", "fast")
     with pytest.raises(ValueError, match="cached"):
         backend.build_vllm_arguments(snapshot, resolve_evaluation_config({}), num_loops=3)
-
-
-@pytest.mark.parametrize("optimize", [True, False])
-def test_reconstruction_states_match_final_full_model_at_every_loop(tmp_path, monkeypatch, optimize):
-    import loopquant.low_rank.reconstruction as training
-    model, tokenizer = tiny(loops=3)
-    config = configuration(tmp_path, loops=3, optimize=optimize)
-    captured = {}
-    original = training.run_block
-
-    def record(model, block, hidden, loop):
-        output = original(model, block, hidden, loop)
-        if not torch.is_grad_enabled():
-            index = next(i for i, candidate in enumerate(model.model.layers) if candidate is block)
-            captured.setdefault((index, loop), []).append(output.clone())
-        return output
-
-    monkeypatch.setattr(training, "run_block", record)
-    LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
-    actual, handles = {}, []
-    for index, block in enumerate(model.model.layers):
-        def hook(_block, _args, kwargs, output, key=index):
-            actual[(key, kwargs["current_ut"])] = output
-        handles.append(block.register_forward_hook(hook, with_kwargs=True))
-    try:
-        with torch.no_grad():
-            model(DATA)
-        for key, value in actual.items():
-            torch.testing.assert_close(value, torch.cat(captured[key]), rtol=0, atol=0)
-    finally:
-        for handle in handles:
-            handle.remove()
-
-
-@pytest.mark.parametrize("sharing", ["prefix", "independent"])
-@pytest.mark.parametrize("setting", ["w4a4", "w4a8"])
-def test_initialization_only_never_optimizes_and_preserves_every_increment(tmp_path, monkeypatch, sharing, setting):
-    import loopquant.low_rank.reconstruction as training
-    model, tokenizer = tiny(loops=3)
-    config = configuration(tmp_path, loops=3, sharing=sharing, setting=setting, optimize=False)
-    initialized, bases, refreshes = {}, {}, []
-    original_initialize, original_run = training.initialize_increment, training.run_block
-
-    def initialize(module, original, loop, **kwargs):
-        original_initialize(module, original, loop, **kwargs)
-        assert not module.A[loop].requires_grad and not module.B[loop].requires_grad
-        initialized[id(module), loop] = [bank[loop].detach().to(module.weight.dtype).clone()
-                                         for bank in (module.A, module.B)]
-        bases[id(module)] = module.weight.detach().clone()
-
-    def refresh(model, block, hidden, loop):
-        assert not torch.is_grad_enabled()
-        assert not any(parameter.requires_grad for parameter in block.parameters())
-        refreshes.append(loop)
-        return original_run(model, block, hidden, loop)
-
-    def forbidden(*args, **kwargs):
-        pytest.fail("initialization-only mode must not construct an optimizer or run backward")
-
-    monkeypatch.setattr(training, "initialize_increment", initialize)
-    monkeypatch.setattr(training, "run_block", refresh)
-    monkeypatch.setattr(torch.optim, "Adam", forbidden)
-    monkeypatch.setattr(torch.Tensor, "backward", forbidden)
-    result = LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
-    assert result.summary["optimization_enabled"] is False
-    assert result.summary["stage_order"][-1] == "incremental_block_initialization"
-    assert len(refreshes) == config.num_loops * len(model.model.layers) * len(DATA)
-    assert not any(parameter.requires_grad for parameter in model.parameters())
-    for block in model.model.layers:
-        for _, module in iter_linears(block):
-            assert torch.equal(module.weight, bases[id(module)])
-            for loop in range(config.num_loops):
-                assert all(torch.equal(bank[loop], expected) for bank, expected in
-                           zip((module.A, module.B), initialized[id(module), loop]))
-    records = result.stage_summaries["low_rank_reconstruction"]["blocks"]
-    assert len(records) == config.num_loops * len(model.model.layers)
-    assert all(record["steps"] == 0 and record["optimization_enabled"] is False
-               and record["initial_loss"] is None and record["final_loss"] is None for record in records)
 
 
 def test_token_cache_tracks_tokenizer_behavior_and_detects_corruption(tmp_path, monkeypatch):
@@ -535,7 +464,7 @@ def test_low_rank_cli_uses_same_save_then_evaluate_route(tmp_path, monkeypatch):
     assert cli.main(["quantize", "--config", str(path), "--model", "unused", "--device", "cpu",
                      "--output-dir", str(output), "--activation-setting", "w4a8", "--save", "--zero-shot"]) == 0
     assert events == ["evaluate"]
-    assert json.loads((output / "quantization_summary.json").read_text(encoding="utf-8"))["rank_schedule"] == [2, 4]
+    assert json.loads((output / "quantization_summary.json").read_text(encoding="utf-8"))["rank_schedule"] == [2, 2]
 
 
 def test_all_low_rank_model_configs_are_valid():
@@ -545,6 +474,7 @@ def test_all_low_rank_model_configs_are_valid():
     for path in paths:
         config = LoopQuantConfig.from_yaml(path)
         assert config.algorithm == "low_rank" and config.method["rank_step"] == 16
+        assert config.method["sharing"] == "independent" and "optimization" not in config.method
         assert "activation_bits" not in config.method
         assert config.output_dir == f"outputs/{path.stem}"
     assert {LoopQuantConfig.from_yaml(path).quantization["activation_setting"] for path in paths} == {"w4a4", "w4a8"}
