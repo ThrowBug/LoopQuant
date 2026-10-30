@@ -621,20 +621,31 @@ decoder-block reconstruction or end-to-end training.
    remains dynamic symmetric G32: [-7,7] for A4 or [-127,127] for A8. Both the
    base and low-rank branch consume the same Z_t; the correction is not requantized.
 3. Replay each unmodified FP block with the original teacher collection batch
-   shapes; collect H_t=Z_t Z_t'/N_t, D_t=Y_t Z_t'/N_t and ||Y_t||²/N_t in FP32
-   (energy reductions use FP64). Rounding uses the original activation dtype.
+   shapes. With original weight W0, form R0_t=Y_t-W0 Z_t directly and collect
+   H_t=Z_t Z_t'/N_t, K_t=R0_t Z_t'/N_t and ||R0_t||²/N_t entirely in FP64.
+   Activation rounding still uses the original activation dtype. Centering avoids
+   subtracting large Y-energy terms when scoring a nearly reconstructed layer.
 4. Start with all low-rank factors zero. With the factors fixed, solve the shared
-   continuous regression, then quantize that solution with GPTQ using the Gram
-   of Z. With Q fixed, whiten each loop's residual cross moment and use exact
-   truncated SVD to solve the regularized rank-k problem.
+   continuous regression as an update from a reference weight, then quantize with
+   GPTQ using the Gram of Z. The reference is FP W0 in the first round and the
+   previous accepted Q in later rounds. Ridge penalizes the update, not the full
+   weight: W_new=W_ref+(D-W_ref H)(H+rho I)^-1, where D includes the current
+   low-rank subtraction. Residual moments compute this without forming large D.
+   With Q fixed, whiten each loop's residual cross moment and use exact truncated
+   SVD to solve the regularized rank-k problem. Its ridge remains rho||L_t||².
 5. Repeat complete Q/low-rank rounds, retaining the full Q/A/B combination with
-   the lowest original, unregularized reconstruction error. Stop if a round does
-   not improve it. Factors and the base are evaluated in their saved dtype;
+   the lowest original, unregularized reconstruction error. Also score a baseline
+   made by GPTQ of W0 plus ordinary weight-error SVD, using the same Z Gram and
+   clips as the alternating candidates. This is not the former FP-X-Gram baseline.
+   Stop if a round does not improve the preceding alternating round. A stronger
+   baseline does not prevent trying later alternating rounds. best_iteration=0
+   means the baseline won. Factors and the base are evaluated in their saved dtype;
    this linear statistical objective does not simulate intermediate BF16 GEMM
    rounding or account for upstream student-state drift.
 
-The old ordinary residual-SVD initialization, block Adam training, STE and
-temporary student-state propagation have been removed. The new configuration is:
+Block Adam training, STE and temporary student-state propagation have been
+removed. Ordinary weight-error SVD is only a comparison/fallback candidate;
+alternating rounds start from zero low-rank factors. The configuration is:
 
 ```yaml
 method:
@@ -657,10 +668,15 @@ is null for equal weights or a positive list of length T; weights are normalized
 The relative ridge is `rho = damp_percent * mean(diag(H))`, computed separately
 for the shared Gram and each loop Gram (diagonal means have a 1e-8 numerical
 floor for zero inputs). The default 0.01 follows GPTQ's relative damping setting.
-Regression solves and whitening include this ridge; GPTQ reuses the resulting
-inverse factor without adding damping twice. The reported loss excludes ridge,
-so a worsening complete round is rejected. Exact SVD avoids optimization-step
-hyperparameters but can be expensive for large projections.
+Gram accumulation, regression, Cholesky, SVD and objective scoring use FP64;
+GPTQ column feedback remains FP32 and reuses the inverse factor without adding
+damping twice. Cholesky checks finite inputs and retries with increasing ridge
+only up to max(requested_percent,0.01) times the diagonal mean, with at most eight
+attempts. Any increase is logged with projection/loop context; run reports store
+the actual shared and per-loop ridge values. Persistent failures report matrix
+shape, diagonal range and attempted damping. The reported loss excludes ridge,
+so a worsening complete round is rejected. Exact SVD and FP64 statistics can
+increase calibration time and memory; this does not change inference precision.
 
 `sharing: prefix` and `solver.weight_update: gptaq` are reserved; selecting them
 for quantization fails before collecting a teacher cache. Old prefix checkpoints
@@ -704,8 +720,9 @@ Teacher keys include original weights, actual token IDs, tokenizer, source code,
 model configuration, loop count and precision. They do not include ranks,
 sharing or solver settings. Derived statistics have their own keys and
 checksums, including activation bits, clipping and token selection. They can be
-reused when ranks, loop weights, damping or alternating rounds change. Old FP-X
-Hessians and old FP32 clip statistics are not reused as Z-based statistics.
+reused when ranks, loop weights, damping or alternating rounds change. The FP64
+residual-moment cache uses version 3; old FP32 linear statistics are recomputed,
+while immutable FP teacher trajectories and the version-2 clip cache are reused.
 Teacher inputs/outputs retain their dtype and are streamed to disk;
 full trajectories and per-loop Grams can require substantial disk space.
 Neither calibration caches nor the original weights are

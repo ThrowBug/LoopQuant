@@ -238,7 +238,7 @@ def _replay_teacher(model, block_index, teacher, config, device, observe):
 
 @torch.no_grad()
 def block_statistics(model, block_index, teacher, config, device):
-    """Fixed clips and per-loop ZZ'/N, YZ'/N, ||Y||²/N, using actual FP Y."""
+    """FP64 per-loop Grams and moments of R0=Y-W0 Z, with fixed clips."""
     act = config.method["activation"]
     bits, group = activation_bits(config), config.quantization["group_size"]
     # Version 2 keeps activation rounding in the teacher/inference dtype. Old
@@ -265,32 +265,38 @@ def block_statistics(model, block_index, teacher, config, device):
         _save_stat(cpath, clips, description)
         del errors
 
-    description = {**description, "clips": {name: value.tolist() for name, value in clips.items()},
-                   "target": "fp_linear_output_without_bias", "accumulation_dtype": "float32"}
+    # Keep the teacher and clip keys intact. Old FP32 Y moments cannot recover
+    # their lost accuracy by casting, so residual statistics get a fresh key.
+    description = {**description, "version": 3,
+                   "clips": {name: value.tolist() for name, value in clips.items()},
+                   "target": "fp_linear_output_without_bias_minus_original_weight_z",
+                   "accumulation_dtype": "float64"}
     path = teacher.directory / "linear_statistics" / fingerprint(description) / filename
     cached = _load_stat(path, description)
-    fields = ("hessian", "cross", "target_energy", "num_tokens")
+    fields = ("hessian", "residual_cross", "residual_energy", "num_tokens")
     if cached is not None:
         return {name: {field: cached[f"{name}.{field}"] for field in fields} for name in modules}, clips
 
     loops = config.num_loops
     statistics = {name: {
-        "hessian": torch.zeros(loops, module.in_features, module.in_features, device=device),
-        "cross": torch.zeros(loops, module.out_features, module.in_features, device=device),
-        "target_energy": torch.zeros(loops, device=device, dtype=torch.float64),
+        "hessian": torch.zeros(loops, module.in_features, module.in_features, device=device, dtype=torch.float64),
+        "residual_cross": torch.zeros(loops, module.out_features, module.in_features, device=device, dtype=torch.float64),
+        "residual_energy": torch.zeros(loops, device=device, dtype=torch.float64),
         "num_tokens": torch.zeros(loops, device=device, dtype=torch.int64),
     } for name, module in modules.items()}
     device_clips = {name: value.to(device) for name, value in clips.items()}
+    references = {name: module.weight.detach().double() for name, module in modules.items()}
 
     def collect_statistics(name, module, loop, value, target):
-        z = quantize_activation(value, bits, group, device_clips[name][loop]).float()
-        y = target.float()
+        z = quantize_activation(value, bits, group, device_clips[name][loop]).double()
+        y = target.double()
         if module.bias is not None:
-            y = y - module.bias.float()
+            y = y - module.bias.double()
+        residual = y - z @ references[name].T
         current = statistics[name]
         current["hessian"][loop].addmm_(z.T, z)
-        current["cross"][loop].addmm_(y.T, z)
-        current["target_energy"][loop] += y.square().sum(dtype=torch.float64)
+        current["residual_cross"][loop].addmm_(residual.T, z)
+        current["residual_energy"][loop] += residual.square().sum()
         current["num_tokens"][loop] += len(z)
 
     _replay_teacher(model, block_index, teacher, config, device, collect_statistics)
@@ -299,8 +305,8 @@ def block_statistics(model, block_index, teacher, config, device):
         if (counts == 0).any():
             raise ValueError("no calibration tokens collected for a loop")
         current["hessian"] /= counts[:, None, None]
-        current["cross"] /= counts[:, None, None]
-        current["target_energy"] /= counts
+        current["residual_cross"] /= counts[:, None, None]
+        current["residual_energy"] /= counts
     flat = {f"{name}.{field}": value.cpu() for name, current in statistics.items()
             for field, value in current.items()}
     _save_stat(path, flat, description)

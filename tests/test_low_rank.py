@@ -135,11 +135,13 @@ def test_linear_statistics_use_quantized_inputs_actual_teacher_and_fixed_clips(t
     handle.remove()
     current = stats["self_attn.q_proj"]
     for loop, (x, y) in enumerate(seen):
-        z = quantize_activation(x, 4, clip=clips["self_attn.q_proj"][loop]).reshape(-1, 32).float()
-        y = y.reshape(-1, 32).float() - projection.bias.float()
+        z = quantize_activation(x, 4, clip=clips["self_attn.q_proj"][loop]).reshape(-1, 32).double()
+        y = y.reshape(-1, 32).double() - projection.bias.double()
+        residual = y - z @ projection.weight.double().T
         torch.testing.assert_close(current["hessian"][loop], z.T @ z / 6)
-        torch.testing.assert_close(current["cross"][loop], y.T @ z / 6)
-        torch.testing.assert_close(current["target_energy"][loop], y.square().sum(dtype=torch.float64) / 6)
+        torch.testing.assert_close(current["residual_cross"][loop], residual.T @ z / 6)
+        torch.testing.assert_close(current["residual_energy"][loop], residual.square().sum() / 6)
+        assert current["hessian"].dtype == current["residual_cross"].dtype == torch.float64
     assert current["num_tokens"].tolist() == [6, 6]
     config.method["solver"]["statistics_tokens_per_loop"] = 4
     capped, _ = block_statistics(model, 0, teacher, config, "cpu")
@@ -175,7 +177,7 @@ def test_alternating_pipeline_never_runs_backward_or_an_optimizer(tmp_path, monk
     for record in records:
         accepted = [step["loss"] for step in record["iterations"] if step["accepted"]]
         assert accepted == sorted(accepted, reverse=True)
-        assert record["final_loss"] == min(step["loss"] for step in record["iterations"])
+        assert record["final_loss"] == min([record["baseline_loss"]] + [step["loss"] for step in record["iterations"]])
 
 
 @pytest.mark.parametrize("setting,bits", [("w4a4", 4), ("w4a8", 8)])
