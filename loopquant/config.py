@@ -63,7 +63,8 @@ DEFAULTS: dict[str, Any] = {
 LOW_RANK_DEFAULTS = {
     "sharing": "independent",
     "rank_step": 16,
-    "solver": {"weight_update": "regression_gptq", "iterations": 3, "damp_percent": 0.01,
+    "solver": {"weight_update": "regression_gptq", "iterations": 3, "damp_percent": 0.001,
+               "quantized_damping_target": "update", "low_rank_damping_target": "weight",
                "loop_weights": None, "block_size": 128, "statistics_tokens_per_loop": None},
     "activation": {"clip_min": 0.5, "clip_max": 1.0, "clip_step": 0.01},
     "rotation": {"enabled": False},
@@ -203,6 +204,9 @@ class LoopQuantConfig:
         damp = solver["damp_percent"]
         if isinstance(damp, bool) or not isinstance(damp, (int, float)) or not 0 < damp < 1:
             raise ValueError("solver.damp_percent must lie in (0, 1)")
+        for name in ("quantized_damping_target", "low_rank_damping_target"):
+            if solver[name] not in ("weight", "update"):
+                raise ValueError(f"solver.{name} must be weight or update")
         if not _positive_integer(solver["block_size"]):
             raise ValueError("solver.block_size must be a positive integer")
         weights = solver["loop_weights"]

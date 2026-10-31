@@ -626,13 +626,14 @@ decoder-block reconstruction or end-to-end training.
    Activation rounding still uses the original activation dtype. Centering avoids
    subtracting large Y-energy terms when scoring a nearly reconstructed layer.
 4. Start with all low-rank factors zero. With the factors fixed, solve the shared
-   continuous regression as an update from a reference weight, then quantize with
-   GPTQ using the Gram of Z. The reference is FP W0 in the first round and the
-   previous accepted Q in later rounds. Ridge penalizes the update, not the full
-   weight: W_new=W_ref+(D-W_ref H)(H+rho I)^-1, where D includes the current
-   low-rank subtraction. Residual moments compute this without forming large D.
-   With Q fixed, whiten each loop's residual cross moment and use exact truncated
-   SVD to solve the regularized rank-k problem. Its ridge remains rho||L_t||².
+   continuous regression, then quantize with GPTQ using the Gram of Z. By default,
+   ridge penalizes the Q update relative to FP W0 in the first round and the
+   previous accepted Q in later rounds: W_new=W_ref+(D-W_ref H)(H+rho I)^-1,
+   where D includes the current low-rank subtraction. Residual moments compute
+   this without forming large D. With Q fixed, whiten each loop's residual cross
+   moment and use exact truncated SVD to solve the regularized rank-k problem.
+   By default, the low-rank ridge penalizes the whole product rho||L_t||².
+   The two damping targets can be selected independently below.
 5. Repeat complete Q/low-rank rounds, retaining the full Q/A/B combination with
    the lowest original, unregularized reconstruction error. Also score a baseline
    made by GPTQ of W0 plus ordinary weight-error SVD, using the same Z Gram and
@@ -654,7 +655,9 @@ method:
   solver:
     weight_update: regression_gptq
     iterations: 3
-    damp_percent: 0.01
+    damp_percent: 0.001
+    quantized_damping_target: update
+    low_rank_damping_target: weight
     loop_weights: null
     block_size: 128
     statistics_tokens_per_loop: null
@@ -665,9 +668,22 @@ Three rounds are a starting setting, not a validated Ouro optimum. `loop_weights
 is null for equal weights or a positive list of length T; weights are normalized.
 `block_size` is the GPTQ processing width, not quantization group size.
 
+`quantized_damping_target` and `low_rank_damping_target` independently choose `weight`
+or `update`. For Q, these add rho||Q||² or rho||Q-Q_ref||² to the continuous
+regression objective; Q_ref is FP W0 initially and the previous accepted Q later.
+For each low-rank branch, they add rho||L_t||² or rho||L_t-L_t,prev||². The latter
+uses zero initially, so both low-rank modes coincide in the first round. Its
+closed-form fit uses H+rho I and C+rho L_t,prev; the entire new L_t remains rank k,
+not just its increment. This regularizes the product B_t A_t, not each factor.
+Both targets use the same `damp_percent`, with their respective Gram scale.
+Missing fields retain the defaults above, including when loading older configs.
+Targets are saved in checkpoint config and run reports; changing them reuses
+teacher, clipping and linear-statistics caches. Candidate selection still uses
+the original reconstruction error without ridge, including the fallback baseline.
+
 The relative ridge is `rho = damp_percent * mean(diag(H))`, computed separately
 for the shared Gram and each loop Gram (diagonal means have a 1e-8 numerical
-floor for zero inputs). The default 0.01 follows GPTQ's relative damping setting.
+floor for zero inputs). The default relative damping is 0.001 for both updates.
 Gram accumulation, regression, Cholesky, SVD and objective scoring use FP64;
 GPTQ column feedback remains FP32 and reuses the inverse factor without adding
 damping twice. Cholesky checks finite inputs and retries with increasing ridge

@@ -53,7 +53,7 @@ def svd_factors(matrix, rank):
 
 
 def low_rank_factors(cross, factor, rank):
-    """Exact rank-k optimum of ||LZ-R||²/N + rho||L||²."""
+    """Rank-k weighted solve; cross already includes any ridge reference."""
     whitened = torch.linalg.solve_triangular(factor, cross.T, upper=False).T
     right, b = svd_factors(whitened, rank)
     a = torch.linalg.solve_triangular(factor.T, right.T, upper=True).T
@@ -90,6 +90,10 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
     """Fit one Q shared by every loop and independent rank-k corrections."""
     if options["weight_update"] != "regression_gptq":
         raise NotImplementedError("solver.weight_update=gptaq is reserved and not implemented")
+    q_target = options.get("quantized_damping_target", "update")
+    low_rank_target = options.get("low_rank_damping_target", "weight")
+    if q_target not in ("weight", "update") or low_rank_target not in ("weight", "update"):
+        raise ValueError("damping targets must be weight or update")
     device, dtype = weight.device, weight.dtype
     stats = {name: value.to(device=device, dtype=torch.float64) for name, value in statistics.items()}
     hessians, crosses = stats["hessian"], stats["residual_cross"]
@@ -119,24 +123,30 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
         baseline_q, baseline_a, baseline_b, stats, weights, reference=original)
     best = baseline_q, baseline_a, baseline_b, baseline_loss, 0
     if logger is not None:
-        logger.info("[LowRank] %s weight-only baseline loss=%.6g", label, baseline_loss)
+        logger.info("[LowRank] %s weight-only baseline loss=%.6g quantized_damping_target=%s low_rank_damping_target=%s",
+                    label, baseline_loss, q_target, low_rank_target)
 
     # The first alternating round still starts with L_t=0 and FP W as reference.
     a = [torch.zeros(rank, weight.shape[1], device=device, dtype=dtype) for _ in range(loops)]
     b = [torch.zeros(weight.shape[0], rank, device=device, dtype=dtype) for _ in range(loops)]
     reference, history, previous_loss = original, [], None
     for iteration in range(1, options["iterations"] + 1):
-        adjusted = shared_cross - (reference - original) @ shared_hessian
+        q_reference = reference if q_target == "update" else torch.zeros_like(original)
+        adjusted = shared_cross - (q_reference - original) @ shared_hessian
         for loop in range(loops):
             adjusted.addmm_(b[loop].double(), a[loop].double() @ hessians[loop], alpha=-float(weights[loop]))
-        # Ridge penalizes the update from reference, not the entire Q matrix.
-        continuous = reference + continuous_weight(adjusted, shared_factor)
+        # A zero reference penalizes Q itself; otherwise penalize its update.
+        continuous = q_reference + continuous_weight(adjusted, shared_factor)
         # Match the final saved base dtype before computing its low-rank residual.
         candidate = gptq(continuous, shared_hessian, bits=bits, group_size=group_size,
                          block_size=options["block_size"], inverse_factor=inverse_factor).to(dtype)
         next_a, next_b = [], []
         for loop in range(loops):
             residual_cross = crosses[loop] - (candidate.double() - original) @ hessians[loop]
+            if low_rank_target == "update":
+                # Constrain the full new L to rank k, not just its increment.
+                previous = b[loop].double() @ a[loop].double()
+                residual_cross = residual_cross + l_damping[loop] * previous
             current_a, current_b = low_rank_factors(residual_cross, factors[loop], rank)
             next_a.append(current_a.to(dtype))
             next_b.append(current_b.to(dtype))
@@ -163,5 +173,6 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
     q, a, b, loss, iteration = best
     report = {"best_iteration": iteration, "final_loss": loss, "base_loss": history[0]["base_loss"],
               "baseline_loss": baseline_loss, "loss_method": "fp64_reference_residual_moments",
+              "quantized_damping_target": q_target, "low_rank_damping_target": low_rank_target,
               "q_damping": q_damping, "low_rank_damping": list(l_damping), "iterations": history}
     return q, a, b, report

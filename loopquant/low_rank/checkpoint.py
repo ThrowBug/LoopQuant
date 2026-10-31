@@ -20,6 +20,9 @@ def _checkpoint_config(values):
     """
     values = deepcopy(values)
     method = values["method"]
+    solver = method.get("solver", {})
+    if "q_damping_target" in solver:
+        solver.setdefault("quantized_damping_target", solver.pop("q_damping_target"))
     if "solver" not in method and ("optimization" in method or "gptq" in method):
         method.pop("optimization", None)
         method.pop("gptq", None)

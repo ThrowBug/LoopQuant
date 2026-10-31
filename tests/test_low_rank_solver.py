@@ -255,3 +255,66 @@ def test_inconsistent_residual_energy_is_not_silently_clamped():
     with pytest.raises(FloatingPointError, match="inconsistent"):
         reconstruction_loss(w, [torch.zeros(1, 2)], [torch.zeros(2, 1)], stats,
                             torch.ones(1), reference=w)
+
+
+@pytest.mark.parametrize("q_target", ["weight", "update"])
+@pytest.mark.parametrize("low_rank_target", ["weight", "update"])
+def test_all_damping_target_combinations_match_normal_equations(monkeypatch, q_target, low_rank_target):
+    import loopquant.low_rank.solver as solver
+    torch.manual_seed(29)
+    w = torch.randn(4, 6) * 0.1
+    z = torch.randn(1, 6, 50)
+    y = (2 * w)[None] @ z
+    stats = residual_moments(z, y, w)
+    q_inputs, low_rank_calls = [], []
+    original_low_rank = solver.low_rank_factors
+
+    def continuous_quantizer(value, *args, **kwargs):
+        # Isolate the two regularized solves from discrete quantization.
+        q_inputs.append(value.clone())
+        return value
+
+    def record_low_rank(cross, factor, rank):
+        a, b = original_low_rank(cross, factor, rank)
+        low_rank_calls.append((cross.clone(), a, b))
+        return a, b
+
+    monkeypatch.setattr(solver, "gptq", continuous_quantizer)
+    monkeypatch.setattr(solver, "low_rank_factors", record_low_rank)
+    options = {"weight_update": "regression_gptq", "iterations": 3, "damp_percent": 0.1,
+               "loop_weights": None, "block_size": 32,
+               "quantized_damping_target": q_target, "low_rank_damping_target": low_rank_target}
+    _, _, _, report = solve_linear(w, stats, rank=4, options=options, group_size=2)
+    assert len(low_rank_calls) >= 2  # the update reference matters after the first round
+    h = stats["hessian"][0]
+    d = y[0].double() @ z[0].double().T / 50
+    q_rho, l_rho = report["q_damping"], report["low_rank_damping"][0]
+    identity = torch.eye(6, dtype=torch.float64)
+    previous_q, previous_l = w.double(), torch.zeros(4, 6, dtype=torch.float64)
+    for continuous, (cross, a, b) in zip(q_inputs[1:], low_rank_calls):
+        q_reference = previous_q if q_target == "update" else torch.zeros_like(previous_q)
+        expected_q = torch.linalg.solve(h + q_rho * identity,
+                                        (d - previous_l @ h + q_rho * q_reference).T).T
+        torch.testing.assert_close(continuous, expected_q, rtol=1e-12, atol=1e-14)
+        stored_q = continuous.to(w.dtype).double()
+        l_reference = previous_l if low_rank_target == "update" else torch.zeros_like(previous_l)
+        expected_cross = d - stored_q @ h + l_rho * l_reference
+        torch.testing.assert_close(cross, expected_cross, rtol=1e-12, atol=1e-14)
+        # Full output rank makes the low-rank solve an independently checkable ridge solution.
+        torch.testing.assert_close(b @ a @ (h + l_rho * identity), expected_cross, rtol=1e-12, atol=1e-14)
+        previous_q = stored_q
+        previous_l = b.to(w.dtype).double() @ a.to(w.dtype).double()
+
+
+def test_low_rank_update_penalty_preserves_total_rank_and_does_not_increase_data_loss():
+    torch.manual_seed(43)
+    z = torch.randn(6, 80, dtype=torch.float64)
+    residual = torch.randn(5, 80, dtype=torch.float64)
+    previous = torch.randn(5, 2, dtype=torch.float64) @ torch.randn(2, 6, dtype=torch.float64)
+    h, c = z @ z.T / 80, residual @ z.T / 80
+    factor, rho = regularized_cholesky(h, 0.1)
+    a, b = low_rank_factors(c + rho * previous, factor, 2)
+    fitted = b @ a
+    assert torch.linalg.matrix_rank(fitted) == 2
+    assert torch.linalg.matrix_rank(fitted - previous) > 2
+    assert (fitted @ z - residual).square().sum() <= (previous @ z - residual).square().sum()

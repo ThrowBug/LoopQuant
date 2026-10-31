@@ -73,6 +73,8 @@ class LowRankPipeline:
             "low_rank_parameters": sum(parameter.numel() for parameter in parameters),
             "low_rank_bytes": sum(parameter.numel() * parameter.element_size() for parameter in parameters),
             "damp_percent": options["damp_percent"], "loop_weights": options["loop_weights"],
+            "quantized_damping_target": options["quantized_damping_target"],
+            "low_rank_damping_target": options["low_rank_damping_target"],
             "teacher_cache": str(teacher.directory),
             "teacher_cache_hit": teacher.hit,
         }

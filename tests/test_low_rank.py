@@ -87,12 +87,57 @@ def test_invalid_method_options_are_rejected(tmp_path, update):
     {"loop_weights": [1]}, {"loop_weights": [1, 0]}, {"loop_weights": [1, float("inf")]},
     {"loop_weights": [1, True]}, {"loop_weights": "equal"}, {"block_size": 0},
     {"statistics_tokens_per_loop": False},
+    {"quantized_damping_target": "increment"}, {"quantized_damping_target": None},
+    {"quantized_damping_target": []},
+    {"low_rank_damping_target": "absolute"}, {"low_rank_damping_target": False},
 ])
 def test_invalid_solver_options(tmp_path, options):
     values = configuration(tmp_path).to_dict()
     values["method"]["solver"].update(options)
     with pytest.raises(ValueError):
         LoopQuantConfig.from_dict(values)
+
+
+def test_missing_damping_targets_preserve_existing_defaults(tmp_path):
+    values = configuration(tmp_path).to_dict()
+    values["method"]["solver"].pop("quantized_damping_target")
+    values["method"]["solver"].pop("low_rank_damping_target")
+    values["method"]["solver"].pop("damp_percent")
+    solver = LoopQuantConfig.from_dict(values).method["solver"]
+    assert solver["quantized_damping_target"] == "update"
+    assert solver["low_rank_damping_target"] == "weight"
+    assert solver["damp_percent"] == 0.001
+
+
+@pytest.mark.parametrize("q_target", ["weight", "update"])
+@pytest.mark.parametrize("low_rank_target", ["weight", "update"])
+@pytest.mark.parametrize("setting", ["w4a4", "w4a8"])
+def test_damping_targets_survive_pipeline_and_checkpoint(tmp_path, q_target, low_rank_target, setting):
+    model, tokenizer = tiny(layers=1)
+    config = configuration(tmp_path, setting=setting)
+    config.method["solver"].update(quantized_damping_target=q_target, low_rank_damping_target=low_rank_target)
+    result = LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
+    for record in [result.summary, *result.stage_summaries["low_rank_solver"]["linears"]]:
+        assert record["quantized_damping_target"] == q_target
+        assert record["low_rank_damping_target"] == low_rank_target
+    snapshot = tmp_path / "checkpoint"
+    save_quantized_checkpoint(model, tokenizer, snapshot)
+    restored, _ = load_quantized_checkpoint(snapshot, device="cpu", num_loops=config.num_loops)
+    restored_options = restored._low_rank_config["method"]["solver"]
+    assert restored_options["quantized_damping_target"] == q_target
+    assert restored_options["low_rank_damping_target"] == low_rank_target
+    with torch.no_grad():
+        torch.testing.assert_close(restored(DATA).logits, model(DATA).logits, rtol=0, atol=0)
+    # Saved snapshots from before the rename must preserve their selected target.
+    manifest_path = snapshot / "checkpoint_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    saved_options = manifest["quantization_config"]["method"]["solver"]
+    saved_options["q_damping_target"] = saved_options.pop("quantized_damping_target")
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    legacy, _ = load_quantized_checkpoint(snapshot, device="cpu", num_loops=config.num_loops)
+    assert legacy._low_rank_config["method"]["solver"]["quantized_damping_target"] == q_target
+    with torch.no_grad():
+        torch.testing.assert_close(legacy(DATA).logits, model(DATA).logits, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("reserved", [{"sharing": "prefix"}, {"solver": {"weight_update": "gptaq"}}])
@@ -153,7 +198,8 @@ def test_linear_statistics_use_quantized_inputs_actual_teacher_and_fixed_clips(t
     # Rank, weights, damping and alternating rounds do not change fixed data.
     config.quantization["activation_setting"] = "w4a4"
     config.method["rank_step"] = 3
-    config.method["solver"].update(iterations=5, damp_percent=0.02, loop_weights=[1, 2])
+    config.method["solver"].update(iterations=5, damp_percent=0.02, loop_weights=[1, 2],
+                                 quantized_damping_target="weight", low_rank_damping_target="update")
     repeat = prepare_teacher_cache(model, tokenizer, DATA, config, "cpu", logging.getLogger())
     assert repeat.hit and repeat.directory == teacher.directory
     monkeypatch.setattr(caching, "run_block", lambda *a, **kw: pytest.fail("statistics cache not reused"))

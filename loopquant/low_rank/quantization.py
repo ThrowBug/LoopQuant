@@ -26,7 +26,7 @@ def fit_clip(value, bits, group_size, ratios):
 
 
 @torch.no_grad()
-def gptq(weight, hessian, *, bits=4, group_size=32, block_size=128, damp_percent=0.01,
+def gptq(weight, hessian, *, bits=4, group_size=32, block_size=128, damp_percent=0.001,
          inverse_factor=None):
     """Quantize one shared matrix; caller defines the multi-loop Hessian."""
     work = weight.detach().float().clone()
