@@ -1,4 +1,4 @@
-"""FP teacher statistics -> alternating shared GPTQ and independent low rank."""
+"""FP teacher statistics -> alternating shared Q and low-rank corrections."""
 
 import logging
 
@@ -19,14 +19,14 @@ class LowRankPipeline:
     def run(self, model, tokenizer, calibration_data):
         config = self.config
         options = config.method["solver"]
-        if config.method["sharing"] != "independent":
-            raise NotImplementedError("sharing=prefix is reserved; the alternating solver implements independent only")
+        sharing = config.method["sharing"]
+        active_rank = config.method["rank_step"] * (config.num_loops if sharing == "prefix" else 1)
         model.eval().requires_grad_(False)
         # Validate the complete structure before publishing an expensive cache.
         for block in model.model.layers:
             for module in original_linears(block).values():
-                if config.method["rank_step"] > min(module.weight.shape):
-                    raise ValueError("rank_step exceeds a target projection's dimensions")
+                if active_rank > min(module.weight.shape):
+                    raise ValueError("active low-rank schedule exceeds a target projection's dimensions")
                 if module.in_features % config.quantization["group_size"]:
                     raise ValueError("target input width is not divisible by group_size")
         teacher = prepare_teacher_cache(model, tokenizer, calibration_data, config, self.device, self.logger)
@@ -40,7 +40,7 @@ class LowRankPipeline:
                 for name, module in original_linears(block).items():
                     label = f"block={index + 1}/{len(model.model.layers)} module={name}"
                     q, a, b, report = solve_linear(
-                        module.weight, statistics.pop(name), rank=rank, options=options,
+                        module.weight, statistics.pop(name), rank=rank, options=options, sharing=sharing,
                         bits=config.quantization["weight_bits"], group_size=config.quantization["group_size"],
                         logger=self.logger, label=label)
                     module.weight.copy_(q)
@@ -68,7 +68,8 @@ class LowRankPipeline:
             "weight_update": options["weight_update"], "iterations": options["iterations"],
             "stage_order": ["teacher_cache", "linear_statistics",
                             f"alternating_{options['weight_update']}_weighted_svd"],
-            "sharing": config.method["sharing"], "rank_step": rank, "rank_schedule": [rank] * config.num_loops,
+            "sharing": sharing, "rank_step": rank,
+            "rank_schedule": [(t + 1) * rank if sharing == "prefix" else rank for t in range(config.num_loops)],
             "low_rank_parameters": sum(parameter.numel() for parameter in parameters),
             "low_rank_bytes": sum(parameter.numel() * parameter.element_size() for parameter in parameters),
             "damp_percent": options["damp_percent"], "loop_weights": options["loop_weights"],

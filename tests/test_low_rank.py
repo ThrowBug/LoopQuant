@@ -113,9 +113,11 @@ def test_missing_damping_targets_preserve_existing_defaults(tmp_path):
 @pytest.mark.parametrize("low_rank_target", ["weight", "update"])
 @pytest.mark.parametrize("setting", ["w4a4", "w4a8"])
 @pytest.mark.parametrize("weight_update", ["regression_gptq", "residual_compensation"])
-def test_damping_targets_survive_pipeline_and_checkpoint(tmp_path, q_target, low_rank_target, setting, weight_update):
+@pytest.mark.parametrize("sharing", ["independent", "prefix"])
+def test_damping_targets_survive_pipeline_and_checkpoint(tmp_path, q_target, low_rank_target, setting,
+                                                       weight_update, sharing):
     model, tokenizer = tiny(layers=1)
-    config = configuration(tmp_path, setting=setting)
+    config = configuration(tmp_path, setting=setting, sharing=sharing)
     config.method["solver"].update(quantized_damping_target=q_target, low_rank_damping_target=low_rank_target,
                                  weight_update=weight_update)
     result = LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
@@ -123,6 +125,8 @@ def test_damping_targets_survive_pipeline_and_checkpoint(tmp_path, q_target, low
         assert record["quantized_damping_target"] == q_target
         assert record["low_rank_damping_target"] == low_rank_target
         assert record["weight_update"] == weight_update
+        assert record["sharing"] == sharing
+        assert record["rank_schedule"] == ([2, 4] if sharing == "prefix" else [2, 2])
     assert result.summary["stage_order"][-1] == f"alternating_{weight_update}_weighted_svd"
     snapshot = tmp_path / "checkpoint"
     save_quantized_checkpoint(model, tokenizer, snapshot)
@@ -131,6 +135,7 @@ def test_damping_targets_survive_pipeline_and_checkpoint(tmp_path, q_target, low
     assert restored_options["quantized_damping_target"] == q_target
     assert restored_options["low_rank_damping_target"] == low_rank_target
     assert restored_options["weight_update"] == weight_update
+    assert restored._low_rank_config["method"]["sharing"] == sharing
     with torch.no_grad():
         torch.testing.assert_close(restored(DATA).logits, model(DATA).logits, rtol=0, atol=0)
     # Saved snapshots from before the rename must preserve their selected target.
@@ -148,19 +153,13 @@ def test_damping_targets_survive_pipeline_and_checkpoint(tmp_path, q_target, low
         torch.testing.assert_close(legacy(DATA).logits, model(DATA).logits, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("reserved", [{"sharing": "prefix"}])
-def test_reserved_solvers_fail_before_collecting_teacher(tmp_path, monkeypatch, reserved):
+def test_prefix_rank_schedule_is_validated_before_collecting_teacher(tmp_path, monkeypatch):
     import loopquant.low_rank.pipeline as pipeline
-    values = configuration(tmp_path).to_dict()
-    for key, value in reserved.items():
-        if isinstance(value, dict):
-            values["method"][key].update(value)
-        else:
-            values["method"][key] = value
-    config = LoopQuantConfig.from_dict(values)
+    config = configuration(tmp_path, sharing="prefix")
+    config.method["rank_step"] = 17
     monkeypatch.setattr(pipeline, "prepare_teacher_cache", lambda *a, **kw: pytest.fail("collected teacher"))
     model, tokenizer = tiny()
-    with pytest.raises(NotImplementedError, match="reserved"):
+    with pytest.raises(ValueError, match="active low-rank schedule"):
         LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
 
 
@@ -206,6 +205,7 @@ def test_linear_statistics_use_quantized_inputs_actual_teacher_and_fixed_clips(t
     # Rank, weights, damping and alternating rounds do not change fixed data.
     config.quantization["activation_setting"] = "w4a4"
     config.method["rank_step"] = 3
+    config.method["sharing"] = "prefix"
     config.method["solver"].update(iterations=5, damp_percent=0.02, loop_weights=[1, 2],
                                  weight_update="residual_compensation",
                                  quantized_damping_target="weight", low_rank_damping_target="update")
@@ -218,21 +218,26 @@ def test_linear_statistics_use_quantized_inputs_actual_teacher_and_fixed_clips(t
     assert torch.equal(cached_clips["self_attn.q_proj"], clips["self_attn.q_proj"])
 
 
-def test_alternating_pipeline_never_runs_backward_or_an_optimizer(tmp_path, monkeypatch):
+@pytest.mark.parametrize("sharing", ["independent", "prefix"])
+def test_alternating_pipeline_never_runs_backward_or_an_optimizer(tmp_path, monkeypatch, sharing):
     def forbidden(*args, **kwargs):
         pytest.fail("alternating closed-form solver must not train with gradients")
     monkeypatch.setattr(torch.optim, "Adam", forbidden)
     monkeypatch.setattr(torch.Tensor, "backward", forbidden)
-    config = configuration(tmp_path, loops=3, iterations=3)
+    config = configuration(tmp_path, loops=3, iterations=3, sharing=sharing)
     model, tokenizer = tiny(loops=3, layers=1)
     result = LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
-    assert result.summary["rank_schedule"] == [2, 2, 2]
+    assert result.summary["rank_schedule"] == ([2, 4, 6] if sharing == "prefix" else [2, 2, 2])
     records = result.stage_summaries["low_rank_solver"]["linears"]
     assert len(records) == 7
     for record in records:
         accepted = [step["loss"] for step in record["iterations"] if step["accepted"]]
         assert accepted == sorted(accepted, reverse=True)
         assert record["final_loss"] == min([record["baseline_loss"]] + [step["loss"] for step in record["iterations"]])
+        if sharing == "prefix":
+            for step in record["iterations"]:
+                assert [update["group"] for update in step["prefix_updates"]] == [1, 2, 3]
+                assert all(update["objective_change"] <= 0 for update in step["prefix_updates"])
 
 
 @pytest.mark.parametrize("setting,bits", [("w4a4", 4), ("w4a8", 8)])
@@ -367,16 +372,17 @@ def test_teacher_collection_requires_positive_integer_batch_size(tmp_path, batch
 
 @pytest.mark.parametrize("setting,bits", [("w4a4", 4), ("w4a8", 8)])
 @pytest.mark.parametrize("weight_update", ["regression_gptq", "residual_compensation"])
-def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, setting, bits, weight_update):
+@pytest.mark.parametrize("sharing", ["independent", "prefix"])
+def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, setting, bits, weight_update, sharing):
     model, tokenizer = tiny()
-    config = configuration(tmp_path, setting=setting)
+    config = configuration(tmp_path, setting=setting, sharing=sharing)
     config.method["solver"]["weight_update"] = weight_update
     frozen = {name: parameter.detach().clone() for name, parameter in model.named_parameters()
               if parameter.ndim == 1 or name.startswith(("model.embed_tokens", "lm_head"))}
     result = LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
     assert result.summary["weight_update"] == weight_update
     assert result.summary["activation_allocation"] == [bits, bits]
-    assert result.summary["rank_schedule"] == [2, 2]
+    assert result.summary["rank_schedule"] == ([2, 4] if sharing == "prefix" else [2, 2])
     assert not any(p.requires_grad for p in result.model.parameters())
     for name, value in frozen.items():
         assert torch.equal(value, dict(model.named_parameters())[name]), name
@@ -499,11 +505,12 @@ def test_token_cache_tracks_tokenizer_behavior_and_detects_corruption(tmp_path, 
         data_module.load_calibration_data(tokenizer, **args)
 
 
-def test_low_rank_cli_uses_same_save_then_evaluate_route(tmp_path, monkeypatch):
+@pytest.mark.parametrize("sharing", ["independent", "prefix"])
+def test_low_rank_cli_uses_same_save_then_evaluate_route(tmp_path, monkeypatch, sharing):
     import yaml
     from loopquant import cli
     model, tokenizer = tiny(layers=1)
-    config = configuration(tmp_path)
+    config = configuration(tmp_path, sharing=sharing)
     path = tmp_path / "run.yaml"
     path.write_text(yaml.safe_dump(config.to_dict()), encoding="utf-8")
     monkeypatch.setattr(cli, "load_looped_transformer", lambda *a, **kw: (model, tokenizer))
@@ -523,7 +530,8 @@ def test_low_rank_cli_uses_same_save_then_evaluate_route(tmp_path, monkeypatch):
     assert cli.main(["quantize", "--config", str(path), "--model", "unused", "--device", "cpu",
                      "--output-dir", str(output), "--activation-setting", "w4a8", "--save", "--zero-shot"]) == 0
     assert events == ["evaluate"]
-    assert json.loads((output / "quantization_summary.json").read_text(encoding="utf-8"))["rank_schedule"] == [2, 2]
+    expected_ranks = [2, 4] if sharing == "prefix" else [2, 2]
+    assert json.loads((output / "quantization_summary.json").read_text(encoding="utf-8"))["rank_schedule"] == expected_ranks
 
 
 def test_all_low_rank_model_configs_are_valid():

@@ -606,12 +606,18 @@ original LoopQuant `compiled`/`fast` modes are not enabled for this new method.
 No dependency changes or low-bit kernels are required for this path.
 
 Each of the seven attention/MLP projections contains one shared W4/G32 base Q
-and an independent rank-k pair B_t A_t for each loop. `method.rank_step` is k;
-`num_loops` is T, with Tk(m+n) low-rank parameters for a matrix of shape (m,n).
+and T stored rank-k pairs B_j A_j. `method.rank_step` is k; `num_loops` is T.
+With `sharing: independent`, loop t uses L_t=B_t A_t. With `sharing: prefix`,
+it uses L_t=sum_{j<=t} B_j A_j, equivalently the first tk columns/rows of the
+concatenated factors. Both store Tk(m+n) low-rank parameters for a matrix of
+shape (m,n). Prefix active rank grows as [k,2k,...,Tk], while independent active
+rank stays k. Prefix therefore uses more low-rank inference work; this is an
+equal-storage comparison, not an equal-compute comparison. Tk must fit every
+target projection's dimensions, checked before teacher collection.
 Embeddings, LM head, norms and biases retain their original floating precision.
 
 The fitter minimizes the weighted sum of linear-output reconstruction errors
-`||(Q + B_t A_t) Z_t - Y_t||² / N_t`. X_t and Y_t come from the FP teacher;
+`||(Q + L_t) Z_t - Y_t||² / N_t`. X_t and Y_t come from the FP teacher;
 Z_t is the fake-quantized/dequantized X_t using a fixed, offline-searched clip.
 Bias is subtracted from Y_t when present. This is a per-Linear objective, not
 decoder-block reconstruction or end-to-end training.
@@ -631,14 +637,17 @@ decoder-block reconstruction or end-to-end training.
    ridge penalizes the Q update relative to FP W0 in the first round and the
    previous accepted Q in later rounds: W_new=W_ref+(D-W_ref H)(H+rho I)^-1,
    where D includes the current low-rank subtraction. Residual moments compute
-   this without forming large D. With Q fixed, whiten each loop's residual cross
-   moment and use exact truncated SVD to solve the regularized rank-k problem.
+   this without forming large D. With Q fixed, independent fits each loop by
+   weighted SVD; prefix makes one forward coordinate pass over its rank-k groups.
    By default, the low-rank ridge penalizes the whole product rho||L_t||².
    The two damping targets can be selected independently below.
 5. Repeat complete Q/low-rank rounds, retaining the full Q/A/B combination with
    the lowest original, unregularized reconstruction error. Also score a baseline
    made by GPTQ of W0 plus ordinary weight-error SVD, using the same Z Gram and
-   clips as the alternating candidates. This is not the former FP-X-Gram baseline.
+   clips as the alternating candidates. Independent repeats the rank-k factors
+   across loops; prefix splits a rank-Tk SVD into T consecutive rank-k groups.
+   This avoids incorrectly repeating and accumulating the same rank-k correction.
+   This is not the former FP-X-Gram baseline.
    Stop if a round does not improve the preceding alternating round. A stronger
    baseline does not prevent trying later alternating rounds. best_iteration=0
    means the baseline won. Factors and the base are evaluated in their saved dtype;
@@ -664,10 +673,30 @@ method:
     statistics_tokens_per_loop: null
 ```
 
-`iterations: 1` performs one Q update followed by one weighted low-rank fit.
+`iterations: 1` performs one Q update followed by one complete low-rank pass.
 Three rounds are a starting setting, not a validated Ouro optimum. `loop_weights`
 is null for equal weights or a positive list of length T; weights are normalized.
 `block_size` is the column processing width, not quantization group size.
+
+Change only `method.sharing` to `prefix` to enable shared-prefix fitting; all
+other configuration fields and launcher arguments remain the same. Each outer
+iteration updates Q using the current complete L_t, freezes Q and the previous
+outer iteration's damping references, then updates groups j=1,...,T exactly once.
+New groups are immediately visible to later groups in that pass. No sweep-count
+setting is added; `iterations` continues to control the number of Q/low-rank rounds.
+
+For group j, all affected loops t>=j contribute. Let P_t be the sum of the other
+groups active in loop t. The coordinate minimizes the weighted reconstruction
+of Y_t-(Q+P_t)Z_t, plus rho_t||D_j+P_t-S_t||². Its Gram is
+sum_{t>=j} lambda_t(H_t+rho_t I); its cross moment is
+sum_{t>=j} lambda_t[K_t-(Q-W0+P_t)H_t+rho_t(S_t-P_t)]. Exact weighted rank-k SVD
+solves this subproblem. All other groups, including later groups from the prior
+iteration, are included in P_t. Factors are rounded to their saved dtype before
+acceptance; a coordinate that increases its regularized quadratic objective is
+kept at its old value. Final complete candidates still use the original loss
+without ridge. Reports include one `prefix_updates` entry per group per round.
+As with the independent path, this optimizes fixed teacher trajectories; it does
+not account for downstream student-state drift or guarantee a PPL improvement.
 
 `weight_update` selects one of two Q solvers; it does not change the low-rank
 SVD, activation clips, iteration selection or inference modules:
@@ -704,10 +733,12 @@ Older checkpoints using `weight_update: gptaq` are migrated to the new name on l
 `quantized_damping_target` and `low_rank_damping_target` independently choose `weight`
 or `update`. For Q, these add rho||Q||² or rho||Q-Q_ref||² to the reconstruction
 objective; Q_ref is FP W0 initially and the previous accepted Q later.
-For each low-rank branch, they add rho||L_t||² or rho||L_t-L_t,prev||². The latter
-uses zero initially, so both low-rank modes coincide in the first round. Its
-closed-form fit uses H+rho I and C+rho L_t,prev; the entire new L_t remains rank k,
-not just its increment. This regularizes the product B_t A_t, not each factor.
+For each low-rank branch, they add rho_t||L_t||² or rho_t||L_t-L_t,prev||². The
+latter uses zero initially, so both modes coincide in the first round. Independent
+uses H+rho I and C+rho L_t,prev in its rank-k fit. Prefix keeps L_t,prev fixed for
+the entire coordinate pass, regularizes the complete cumulative L_t, and constrains
+each increment D_j to rank k. Its cumulative rank is at most tk. Neither mode
+regularizes A/B separately or constrains only the optimization-step difference.
 Both targets use the same `damp_percent`, with their respective Gram scale.
 Missing fields retain the defaults above, including when loading older configs.
 Targets are saved in checkpoint config and run reports; changing them reuses
@@ -722,14 +753,19 @@ GPTQ column feedback remains FP32 and reuses the inverse factor without adding
 damping twice. Cholesky checks finite inputs and retries with increasing ridge
 only up to max(requested_percent,0.01) times the diagonal mean, with at most eight
 attempts. Any increase is logged with projection/loop context; run reports store
-the actual shared and per-loop ridge values. Persistent failures report matrix
+the actual shared and per-loop ridge values. Prefix combines the per-loop ridge
+values into suffix Grams, without adding a second ridge. A stability increase
+for suffix j is assigned to loop j and carried into earlier suffixes; later
+suffixes stay unchanged, so all coordinates retain one consistent objective.
+The resulting values are recorded as `low_rank_damping` and `prefix_group_damping`.
+Persistent failures report matrix
 shape, diagonal range and attempted damping. The reported loss excludes ridge,
 so a worsening complete round is rejected. Exact SVD and FP64 statistics can
 increase calibration time and memory; this does not change inference precision.
 
-`sharing: prefix` is reserved; selecting it for quantization fails before
-collecting a teacher cache. Old prefix checkpoints
-still load for HF and vLLM inference. Old quantization YAMLs must be migrated to
+Both sharing modes reuse the same teacher, clipping and linear-statistics caches,
+checkpoint format, and HF/vLLM inference modules. Old prefix checkpoints still
+load for inference. Old quantization YAMLs must be migrated to
 the new fields; old checkpoint optimizer metadata is migrated only during loading.
 The former `hessian_mode: mean_activation` ablation is not part of this objective.
 

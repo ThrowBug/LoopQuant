@@ -7,7 +7,7 @@ num_loops: 4
 quantization: {weight_bits: 4, group_size: 32, activation_setting: w4a4}
 calibration: {dataset: wikitext2, split: train, num_samples: 128, sequence_length: 2048, seed: 0, batch_size: 4, cache_dir: cache/calibration}
 method:
-  sharing: independent  # prefix is reserved for a future solver
+  sharing: independent  # independent or prefix
   rank_step: 16
   solver:
     weight_update: regression_gptq
