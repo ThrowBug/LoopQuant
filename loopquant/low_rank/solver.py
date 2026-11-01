@@ -5,6 +5,7 @@ import math
 import torch
 
 from .quantization import gptq
+from .residual_compensation import residual_compensation
 
 
 def regularized_cholesky(hessian, damp_percent, *, logger=None, label=""):
@@ -88,8 +89,9 @@ def reconstruction_loss(weight, a, b, statistics, loop_weights, *, reference):
 def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
                  logger=None, label=""):
     """Fit one Q shared by every loop and independent rank-k corrections."""
-    if options["weight_update"] != "regression_gptq":
-        raise NotImplementedError("solver.weight_update=gptaq is reserved and not implemented")
+    weight_update = options["weight_update"]
+    if weight_update not in ("regression_gptq", "residual_compensation"):
+        raise ValueError("solver.weight_update must be regression_gptq or residual_compensation")
     q_target = options.get("quantized_damping_target", "update")
     low_rank_target = options.get("low_rank_damping_target", "weight")
     if q_target not in ("weight", "update") or low_rank_target not in ("weight", "update"):
@@ -107,7 +109,10 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
     shared_cross = (crosses * weights[:, None, None]).sum(0)
     shared_factor, q_damping = regularized_cholesky(
         shared_hessian, options["damp_percent"], logger=logger, label=f"{label} shared Q")
-    inverse_factor = torch.linalg.cholesky(torch.cholesky_inverse(shared_factor), upper=True).float()
+    inverse_factor64 = torch.linalg.cholesky(torch.cholesky_inverse(shared_factor), upper=True)
+    inverse_factor = inverse_factor64.float()
+    if weight_update != "residual_compensation":
+        inverse_factor64 = None
     factors, l_damping = zip(*(regularized_cholesky(
         h, options["damp_percent"], logger=logger, label=f"{label} loop={loop + 1}")
         for loop, h in enumerate(hessians)))
@@ -123,8 +128,9 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
         baseline_q, baseline_a, baseline_b, stats, weights, reference=original)
     best = baseline_q, baseline_a, baseline_b, baseline_loss, 0
     if logger is not None:
-        logger.info("[LowRank] %s weight-only baseline loss=%.6g quantized_damping_target=%s low_rank_damping_target=%s",
-                    label, baseline_loss, q_target, low_rank_target)
+        logger.info("[LowRank] %s weight-only baseline loss=%.6g weight_update=%s "
+                    "quantized_damping_target=%s low_rank_damping_target=%s",
+                    label, baseline_loss, weight_update, q_target, low_rank_target)
 
     # The first alternating round still starts with L_t=0 and FP W as reference.
     a = [torch.zeros(rank, weight.shape[1], device=device, dtype=dtype) for _ in range(loops)]
@@ -132,14 +138,23 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
     reference, history, previous_loss = original, [], None
     for iteration in range(1, options["iterations"] + 1):
         q_reference = reference if q_target == "update" else torch.zeros_like(original)
-        adjusted = shared_cross - (q_reference - original) @ shared_hessian
+        if weight_update == "regression_gptq":
+            adjusted = shared_cross - (q_reference - original) @ shared_hessian
+        else:
+            # Negative half-gradient at W0, including the chosen ridge reference.
+            # Keep it centered; never reconstruct a large Y Z' cross moment.
+            adjusted = shared_cross + q_damping * (q_reference - original)
         for loop in range(loops):
             adjusted.addmm_(b[loop].double(), a[loop].double() @ hessians[loop], alpha=-float(weights[loop]))
-        # A zero reference penalizes Q itself; otherwise penalize its update.
-        continuous = q_reference + continuous_weight(adjusted, shared_factor)
+        if weight_update == "regression_gptq":
+            continuous = q_reference + continuous_weight(adjusted, shared_factor)
+            candidate = gptq(continuous, shared_hessian, bits=bits, group_size=group_size,
+                             block_size=options["block_size"], inverse_factor=inverse_factor)
+        else:
+            candidate = residual_compensation(original, adjusted, bits=bits, group_size=group_size,
+                                               block_size=options["block_size"], inverse_factor=inverse_factor64)
         # Match the final saved base dtype before computing its low-rank residual.
-        candidate = gptq(continuous, shared_hessian, bits=bits, group_size=group_size,
-                         block_size=options["block_size"], inverse_factor=inverse_factor).to(dtype)
+        candidate = candidate.to(dtype)
         next_a, next_b = [], []
         for loop in range(loops):
             residual_cross = crosses[loop] - (candidate.double() - original) @ hessians[loop]
@@ -173,6 +188,10 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
     q, a, b, loss, iteration = best
     report = {"best_iteration": iteration, "final_loss": loss, "base_loss": history[0]["base_loss"],
               "baseline_loss": baseline_loss, "loss_method": "fp64_reference_residual_moments",
+              "weight_update": weight_update,
+              "weight_update_implementation": ("continuous_regression_gptq" if weight_update == "regression_gptq"
+                                                else weight_update),
+              "selected_candidate": "baseline" if iteration == 0 else weight_update,
               "quantized_damping_target": q_target, "low_rank_damping_target": low_rank_target,
               "q_damping": q_damping, "low_rank_damping": list(l_damping), "iterations": history}
     return q, a, b, report

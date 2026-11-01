@@ -197,8 +197,8 @@ class LoopQuantConfig:
         if any(method[name]["enabled"] for name in ("rotation", "channel_scaling")):
             raise ValueError("low_rank rotation and channel_scaling are not implemented; keep enabled=false")
         solver = method["solver"]
-        if solver["weight_update"] not in {"regression_gptq", "gptaq"}:
-            raise ValueError("solver.weight_update must be regression_gptq or gptaq")
+        if solver["weight_update"] not in {"regression_gptq", "residual_compensation"}:
+            raise ValueError("solver.weight_update must be regression_gptq or residual_compensation")
         if not _positive_integer(solver["iterations"]):
             raise ValueError("solver.iterations must be a positive integer")
         damp = solver["damp_percent"]

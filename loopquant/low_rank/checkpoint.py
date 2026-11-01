@@ -23,6 +23,8 @@ def _checkpoint_config(values):
     solver = method.get("solver", {})
     if "q_damping_target" in solver:
         solver.setdefault("quantized_damping_target", solver.pop("q_damping_target"))
+    if solver.get("weight_update") == "gptaq":
+        solver["weight_update"] = "residual_compensation"
     if "solver" not in method and ("optimization" in method or "gptq" in method):
         method.pop("optimization", None)
         method.pop("gptq", None)

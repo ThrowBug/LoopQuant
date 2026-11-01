@@ -625,8 +625,9 @@ decoder-block reconstruction or end-to-end training.
    H_t=Z_t Z_t'/N_t, K_t=R0_t Z_t'/N_t and ||R0_t||²/N_t entirely in FP64.
    Activation rounding still uses the original activation dtype. Centering avoids
    subtracting large Y-energy terms when scoring a nearly reconstructed layer.
-4. Start with all low-rank factors zero. With the factors fixed, solve the shared
-   continuous regression, then quantize with GPTQ using the Gram of Z. By default,
+4. Start with all low-rank factors zero. With the factors fixed, update shared Q
+   using the selected weight solver. The default `regression_gptq` solves the
+   continuous regression, then quantizes with GPTQ using the Gram of Z. By default,
    ridge penalizes the Q update relative to FP W0 in the first round and the
    previous accepted Q in later rounds: W_new=W_ref+(D-W_ref H)(H+rho I)^-1,
    where D includes the current low-rank subtraction. Residual moments compute
@@ -666,11 +667,43 @@ method:
 `iterations: 1` performs one Q update followed by one weighted low-rank fit.
 Three rounds are a starting setting, not a validated Ouro optimum. `loop_weights`
 is null for equal weights or a positive list of length T; weights are normalized.
-`block_size` is the GPTQ processing width, not quantization group size.
+`block_size` is the column processing width, not quantization group size.
+
+`weight_update` selects one of two Q solvers; it does not change the low-rank
+SVD, activation clips, iteration selection or inference modules:
+
+- `regression_gptq` (default): continuous ridge regression followed by GPTQ.
+- `residual_compensation`: fixed-target residual compensation, adapted to arbitrary
+  output targets E_t=Y_t-L_t Z_t. Each round starts its working weights from FP W0;
+  the damping reference remains independently controlled below. It rounds the
+  first column on W0's group grid, then compensates all free columns for both
+  rounding and the full fixed-target residual. Once those columns reach their
+  conditional continuous optimum, later columns use ordinary GPTQ rounding
+  feedback. This avoids forming the unrestricted regression solution up front.
+
+Enable the new path by changing only `method.solver.weight_update` to `residual_compensation`.
+Both paths reuse the same FP teacher, activation-clip and FP64 residual-moment
+caches; no new statistics, dependencies or checkpoint format are required.
+The Q objective includes rho||Q-S||² in either path. For residual compensation,
+the residual at W0 is sum_t lambda_t(K_t-L_t H_t)+rho(S-W0);
+the actual Cholesky damping is used, with
+no second application of ridge. Residual projection uses FP64; column work,
+group-scale search and rounding feedback use FP32, as in the existing GPTQ.
+
+The `residual_compensation` option uses a constrained update inspired by GPTAQ.
+It does not reproduce the official implementation's input-neuron residual decomposition.
+After fixing each rounded column, its free-weight update solves the conditional
+quadratic objective, up to floating-point rounding; this is not a global discrete
+optimum. Completing the square gives the same underlying objective as continuous
+regression plus GPTQ. Differences come from rounding order and group grids, and
+neither path is guaranteed to improve PPL. Reports identify this variant as
+`weight_update_implementation: residual_compensation`; `selected_candidate: baseline`
+and `best_iteration: 0` mean the fallback won, even if `residual_compensation` was requested.
+Older checkpoints using `weight_update: gptaq` are migrated to the new name on load.
 
 `quantized_damping_target` and `low_rank_damping_target` independently choose `weight`
-or `update`. For Q, these add rho||Q||² or rho||Q-Q_ref||² to the continuous
-regression objective; Q_ref is FP W0 initially and the previous accepted Q later.
+or `update`. For Q, these add rho||Q||² or rho||Q-Q_ref||² to the reconstruction
+objective; Q_ref is FP W0 initially and the previous accepted Q later.
 For each low-rank branch, they add rho||L_t||² or rho||L_t-L_t,prev||². The latter
 uses zero initially, so both low-rank modes coincide in the first round. Its
 closed-form fit uses H+rho I and C+rho L_t,prev; the entire new L_t remains rank k,
@@ -694,8 +727,8 @@ shape, diagonal range and attempted damping. The reported loss excludes ridge,
 so a worsening complete round is rejected. Exact SVD and FP64 statistics can
 increase calibration time and memory; this does not change inference precision.
 
-`sharing: prefix` and `solver.weight_update: gptaq` are reserved; selecting them
-for quantization fails before collecting a teacher cache. Old prefix checkpoints
+`sharing: prefix` is reserved; selecting it for quantization fails before
+collecting a teacher cache. Old prefix checkpoints
 still load for HF and vLLM inference. Old quantization YAMLs must be migrated to
 the new fields; old checkpoint optimizer metadata is migrated only during loading.
 The former `hessian_mode: mean_activation` ablation is not part of this objective.

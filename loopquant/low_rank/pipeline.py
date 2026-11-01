@@ -21,8 +21,6 @@ class LowRankPipeline:
         options = config.method["solver"]
         if config.method["sharing"] != "independent":
             raise NotImplementedError("sharing=prefix is reserved; the alternating solver implements independent only")
-        if options["weight_update"] != "regression_gptq":
-            raise NotImplementedError("solver.weight_update=gptaq is reserved and not implemented")
         model.eval().requires_grad_(False)
         # Validate the complete structure before publishing an expensive cache.
         for block in model.model.layers:
@@ -68,7 +66,8 @@ class LowRankPipeline:
             "algorithm": "low_rank", "fake_quantization": True,
             "activation_allocation": list(model._loopquant_allocation),
             "weight_update": options["weight_update"], "iterations": options["iterations"],
-            "stage_order": ["teacher_cache", "linear_statistics", "alternating_regression_gptq_weighted_svd"],
+            "stage_order": ["teacher_cache", "linear_statistics",
+                            f"alternating_{options['weight_update']}_weighted_svd"],
             "sharing": config.method["sharing"], "rank_step": rank, "rank_schedule": [rank] * config.num_loops,
             "low_rank_parameters": sum(parameter.numel() for parameter in parameters),
             "low_rank_bytes": sum(parameter.numel() * parameter.element_size() for parameter in parameters),

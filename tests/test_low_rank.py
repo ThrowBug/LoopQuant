@@ -112,20 +112,25 @@ def test_missing_damping_targets_preserve_existing_defaults(tmp_path):
 @pytest.mark.parametrize("q_target", ["weight", "update"])
 @pytest.mark.parametrize("low_rank_target", ["weight", "update"])
 @pytest.mark.parametrize("setting", ["w4a4", "w4a8"])
-def test_damping_targets_survive_pipeline_and_checkpoint(tmp_path, q_target, low_rank_target, setting):
+@pytest.mark.parametrize("weight_update", ["regression_gptq", "residual_compensation"])
+def test_damping_targets_survive_pipeline_and_checkpoint(tmp_path, q_target, low_rank_target, setting, weight_update):
     model, tokenizer = tiny(layers=1)
     config = configuration(tmp_path, setting=setting)
-    config.method["solver"].update(quantized_damping_target=q_target, low_rank_damping_target=low_rank_target)
+    config.method["solver"].update(quantized_damping_target=q_target, low_rank_damping_target=low_rank_target,
+                                 weight_update=weight_update)
     result = LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
     for record in [result.summary, *result.stage_summaries["low_rank_solver"]["linears"]]:
         assert record["quantized_damping_target"] == q_target
         assert record["low_rank_damping_target"] == low_rank_target
+        assert record["weight_update"] == weight_update
+    assert result.summary["stage_order"][-1] == f"alternating_{weight_update}_weighted_svd"
     snapshot = tmp_path / "checkpoint"
     save_quantized_checkpoint(model, tokenizer, snapshot)
     restored, _ = load_quantized_checkpoint(snapshot, device="cpu", num_loops=config.num_loops)
     restored_options = restored._low_rank_config["method"]["solver"]
     assert restored_options["quantized_damping_target"] == q_target
     assert restored_options["low_rank_damping_target"] == low_rank_target
+    assert restored_options["weight_update"] == weight_update
     with torch.no_grad():
         torch.testing.assert_close(restored(DATA).logits, model(DATA).logits, rtol=0, atol=0)
     # Saved snapshots from before the rename must preserve their selected target.
@@ -133,14 +138,17 @@ def test_damping_targets_survive_pipeline_and_checkpoint(tmp_path, q_target, low
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     saved_options = manifest["quantization_config"]["method"]["solver"]
     saved_options["q_damping_target"] = saved_options.pop("quantized_damping_target")
+    if weight_update == "residual_compensation":
+        saved_options["weight_update"] = "gptaq"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     legacy, _ = load_quantized_checkpoint(snapshot, device="cpu", num_loops=config.num_loops)
     assert legacy._low_rank_config["method"]["solver"]["quantized_damping_target"] == q_target
+    assert legacy._low_rank_config["method"]["solver"]["weight_update"] == weight_update
     with torch.no_grad():
         torch.testing.assert_close(legacy(DATA).logits, model(DATA).logits, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("reserved", [{"sharing": "prefix"}, {"solver": {"weight_update": "gptaq"}}])
+@pytest.mark.parametrize("reserved", [{"sharing": "prefix"}])
 def test_reserved_solvers_fail_before_collecting_teacher(tmp_path, monkeypatch, reserved):
     import loopquant.low_rank.pipeline as pipeline
     values = configuration(tmp_path).to_dict()
@@ -199,6 +207,7 @@ def test_linear_statistics_use_quantized_inputs_actual_teacher_and_fixed_clips(t
     config.quantization["activation_setting"] = "w4a4"
     config.method["rank_step"] = 3
     config.method["solver"].update(iterations=5, damp_percent=0.02, loop_weights=[1, 2],
+                                 weight_update="residual_compensation",
                                  quantized_damping_target="weight", low_rank_damping_target="update")
     repeat = prepare_teacher_cache(model, tokenizer, DATA, config, "cpu", logging.getLogger())
     assert repeat.hit and repeat.directory == teacher.directory
@@ -357,13 +366,15 @@ def test_teacher_collection_requires_positive_integer_batch_size(tmp_path, batch
 
 
 @pytest.mark.parametrize("setting,bits", [("w4a4", 4), ("w4a8", 8)])
-def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, setting, bits):
+@pytest.mark.parametrize("weight_update", ["regression_gptq", "residual_compensation"])
+def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, setting, bits, weight_update):
     model, tokenizer = tiny()
     config = configuration(tmp_path, setting=setting)
+    config.method["solver"]["weight_update"] = weight_update
     frozen = {name: parameter.detach().clone() for name, parameter in model.named_parameters()
               if parameter.ndim == 1 or name.startswith(("model.embed_tokens", "lm_head"))}
     result = LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
-    assert result.summary["weight_update"] == "regression_gptq"
+    assert result.summary["weight_update"] == weight_update
     assert result.summary["activation_allocation"] == [bits, bits]
     assert result.summary["rank_schedule"] == [2, 2]
     assert not any(p.requires_grad for p in result.model.parameters())
@@ -376,7 +387,7 @@ def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, setting, b
     save_quantized_checkpoint(model, tokenizer, checkpoint, quantization_config=config.to_dict(), max_shard_bytes=15000)
     manifest_path = checkpoint / "checkpoint_manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    assert manifest["quantization_config"]["method"]["solver"]["weight_update"] == "regression_gptq"
+    assert manifest["quantization_config"]["method"]["solver"]["weight_update"] == weight_update
     restored, _ = load_quantized_checkpoint(checkpoint, device="cpu", num_loops=2)
     assert restored._low_rank_config["method"]["solver"]["iterations"] == 2
     assert restored._loopquant_allocation == (bits, bits)
