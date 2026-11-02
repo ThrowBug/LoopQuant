@@ -27,12 +27,12 @@ from test_evaluation import tiny_model_and_tokenizer
 from test_vllm import bridge_module
 
 
-def configuration(tmp_path, *, loops=2, sharing="independent", setting="w4a4", iterations=2):
+def configuration(tmp_path, *, loops=2, sharing="independent", setting="w4a4", iterations=2, rank_step=2):
     return LoopQuantConfig.from_dict({
         "algorithm": "low_rank", "num_loops": loops, "model_key": "tiny",
         "quantization": {"activation_setting": setting},
         "calibration": {"cache_dir": str(tmp_path / "cache"), "num_samples": 2, "sequence_length": 3},
-        "method": {"sharing": sharing, "rank_step": 2, "solver": {"iterations": iterations},
+        "method": {"sharing": sharing, "rank_step": rank_step, "solver": {"iterations": iterations},
                    "activation": {"clip_min": 0.8, "clip_max": 1.0, "clip_step": 0.1}},
     })
 
@@ -66,7 +66,8 @@ def test_config_uses_configured_loops_and_equal_storage(tmp_path, loops, sharing
 
 
 @pytest.mark.parametrize("update", [
-    {"sharing": "typo"}, {"rank_step": 0}, {"rotation": {"enabled": True}},
+    {"sharing": "typo"}, {"rank_step": -1}, {"rank_step": False}, {"rank_step": 1.5},
+    {"rotation": {"enabled": True}},
     {"channel_scaling": {"enabled": True}}, {"solver": {"iterations": 0}},
     {"activation_bits": [4, 8]}, {"activation_bits": 6}, {"optimization": {"steps": 0}},
 ])
@@ -98,14 +99,14 @@ def test_invalid_solver_options(tmp_path, options):
         LoopQuantConfig.from_dict(values)
 
 
-def test_missing_damping_targets_preserve_existing_defaults(tmp_path):
+def test_missing_damping_targets_default_to_update(tmp_path):
     values = configuration(tmp_path).to_dict()
     values["method"]["solver"].pop("quantized_damping_target")
     values["method"]["solver"].pop("low_rank_damping_target")
     values["method"]["solver"].pop("damp_percent")
     solver = LoopQuantConfig.from_dict(values).method["solver"]
     assert solver["quantized_damping_target"] == "update"
-    assert solver["low_rank_damping_target"] == "weight"
+    assert solver["low_rank_damping_target"] == "update"
     assert solver["damp_percent"] == 0.001
 
 
@@ -204,7 +205,7 @@ def test_linear_statistics_use_quantized_inputs_actual_teacher_and_fixed_clips(t
     assert not torch.equal(stats8["self_attn.q_proj"]["hessian"], current["hessian"])
     # Rank, weights, damping and alternating rounds do not change fixed data.
     config.quantization["activation_setting"] = "w4a4"
-    config.method["rank_step"] = 3
+    config.method["rank_step"] = 0
     config.method["sharing"] = "prefix"
     config.method["solver"].update(iterations=5, damp_percent=0.02, loop_weights=[1, 2],
                                  weight_update="residual_compensation",
@@ -373,16 +374,18 @@ def test_teacher_collection_requires_positive_integer_batch_size(tmp_path, batch
 @pytest.mark.parametrize("setting,bits", [("w4a4", 4), ("w4a8", 8)])
 @pytest.mark.parametrize("weight_update", ["regression_gptq", "residual_compensation"])
 @pytest.mark.parametrize("sharing", ["independent", "prefix"])
-def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, setting, bits, weight_update, sharing):
+@pytest.mark.parametrize("rank_step", [0, 2])
+def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, setting, bits, weight_update, sharing, rank_step):
     model, tokenizer = tiny()
-    config = configuration(tmp_path, setting=setting, sharing=sharing)
+    config = configuration(tmp_path, setting=setting, sharing=sharing, rank_step=rank_step)
     config.method["solver"]["weight_update"] = weight_update
     frozen = {name: parameter.detach().clone() for name, parameter in model.named_parameters()
               if parameter.ndim == 1 or name.startswith(("model.embed_tokens", "lm_head"))}
     result = LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
     assert result.summary["weight_update"] == weight_update
     assert result.summary["activation_allocation"] == [bits, bits]
-    assert result.summary["rank_schedule"] == ([2, 4] if sharing == "prefix" else [2, 2])
+    assert result.summary["rank_schedule"] == ([rank_step, 2 * rank_step] if sharing == "prefix"
+                                               else [rank_step, rank_step])
     assert not any(p.requires_grad for p in result.model.parameters())
     for name, value in frozen.items():
         assert torch.equal(value, dict(model.named_parameters())[name]), name
@@ -422,13 +425,15 @@ def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, setting, b
 
 @pytest.mark.parametrize("sharing", ["prefix", "independent"])
 @pytest.mark.parametrize("setting,bits", [("w4a4", 4), ("w4a8", 8)])
-def test_low_rank_vllm_prefill_decode_and_method_dispatch(tmp_path, bridge_module, monkeypatch, sharing, setting, bits):
+@pytest.mark.parametrize("rank_step", [0, 2])
+def test_low_rank_vllm_prefill_decode_and_method_dispatch(tmp_path, bridge_module, monkeypatch, sharing, setting,
+                                                      bits, rank_step):
     import loopquant.vllm_backend as backend
     from loopquant.evaluation_config import resolve_evaluation_config
     monkeypatch.delitem(sys.modules, "loopquant.low_rank.vllm_model", raising=False)
     bridge_class = importlib.import_module("loopquant.low_rank.vllm_model").LowRankOuroForCausalLM
     torch.manual_seed(89)
-    config = configuration(tmp_path, loops=3, sharing=sharing, setting=setting)
+    config = configuration(tmp_path, loops=3, sharing=sharing, setting=setting, rank_step=rank_step)
     model = PagedOuroForCausalLM(PagedOuroConfig(num_hidden_layers=2, total_ut_steps=3)).to(torch.bfloat16).eval()
     configure_looped_model(model, 3, quantization_hooks=False)
     wrap_linears(model, config)
@@ -446,7 +451,7 @@ def test_low_rank_vllm_prefill_decode_and_method_dispatch(tmp_path, bridge_modul
     _, tokenizer = tiny_model_and_tokenizer()
     snapshot = tmp_path / "loopquant"
     save_quantized_checkpoint(model, tokenizer, snapshot)
-    if sharing == "prefix":
+    if sharing == "prefix" and rank_step:
         # Old prefix snapshots remain usable without restoring the deleted fitter.
         manifest_path = snapshot / "checkpoint_manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -506,11 +511,12 @@ def test_token_cache_tracks_tokenizer_behavior_and_detects_corruption(tmp_path, 
 
 
 @pytest.mark.parametrize("sharing", ["independent", "prefix"])
-def test_low_rank_cli_uses_same_save_then_evaluate_route(tmp_path, monkeypatch, sharing):
+@pytest.mark.parametrize("rank_step", [0, 2])
+def test_low_rank_cli_uses_same_save_then_evaluate_route(tmp_path, monkeypatch, sharing, rank_step):
     import yaml
     from loopquant import cli
     model, tokenizer = tiny(layers=1)
-    config = configuration(tmp_path, sharing=sharing)
+    config = configuration(tmp_path, sharing=sharing, rank_step=rank_step)
     path = tmp_path / "run.yaml"
     path.write_text(yaml.safe_dump(config.to_dict()), encoding="utf-8")
     monkeypatch.setattr(cli, "load_looped_transformer", lambda *a, **kw: (model, tokenizer))
@@ -530,7 +536,7 @@ def test_low_rank_cli_uses_same_save_then_evaluate_route(tmp_path, monkeypatch, 
     assert cli.main(["quantize", "--config", str(path), "--model", "unused", "--device", "cpu",
                      "--output-dir", str(output), "--activation-setting", "w4a8", "--save", "--zero-shot"]) == 0
     assert events == ["evaluate"]
-    expected_ranks = [2, 4] if sharing == "prefix" else [2, 2]
+    expected_ranks = [rank_step, 2 * rank_step] if sharing == "prefix" else [rank_step, rank_step]
     assert json.loads((output / "quantization_summary.json").read_text(encoding="utf-8"))["rank_schedule"] == expected_ranks
 
 

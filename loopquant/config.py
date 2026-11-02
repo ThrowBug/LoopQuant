@@ -64,7 +64,7 @@ LOW_RANK_DEFAULTS = {
     "sharing": "independent",
     "rank_step": 16,
     "solver": {"weight_update": "regression_gptq", "iterations": 3, "damp_percent": 0.001,
-               "quantized_damping_target": "update", "low_rank_damping_target": "weight",
+               "quantized_damping_target": "update", "low_rank_damping_target": "update",
                "loop_weights": None, "block_size": 128, "statistics_tokens_per_loop": None},
     "activation": {"clip_min": 0.5, "clip_max": 1.0, "clip_step": 0.01},
     "rotation": {"enabled": False},
@@ -192,8 +192,8 @@ class LoopQuantConfig:
         if method["sharing"] not in {"prefix", "independent"}:
             raise ValueError("sharing must be prefix or independent")
         rank = method["rank_step"]
-        if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
-            raise ValueError("rank_step must be a positive integer")
+        if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+            raise ValueError("rank_step must be a nonnegative integer")
         if any(method[name]["enabled"] for name in ("rotation", "channel_scaling")):
             raise ValueError("low_rank rotation and channel_scaling are not implemented; keep enabled=false")
         solver = method["solver"]

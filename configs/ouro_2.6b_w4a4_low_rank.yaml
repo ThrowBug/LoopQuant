@@ -14,7 +14,7 @@ method:
     iterations: 3
     damp_percent: 0.001
     quantized_damping_target: update
-    low_rank_damping_target: weight
+    low_rank_damping_target: update
     loop_weights: null
     block_size: 128
     statistics_tokens_per_loop: null

@@ -616,6 +616,20 @@ equal-storage comparison, not an equal-compute comparison. Tk must fit every
 target projection's dimensions, checked before teacher collection.
 Embeddings, LM head, norms and biases retain their original floating precision.
 
+Set `method.rank_step: 0` for a pure-quantization ablation within `algorithm: low_rank`.
+Both Q solvers remain available, with L_t=0 throughout fitting; this does not fit
+compensation and remove it afterwards. Activation quantization and the existing
+offline clipping search remain active. The fitter skips all low-rank SVDs and
+per-loop/prefix Cholesky factors; inference executes only the base linear map
+after activation quantization. No A/B parameters are allocated or saved.
+`sharing` and `low_rank_damping_target` have no effect in this mode. `iterations`
+still limits Q updates, using the selected Q damping reference and the existing
+best-candidate/early-stop rules. Its comparison baseline is plain GPTQ of W0
+using the same Z Gram, without SVD compensation. Calibration caches, checkpoint
+format, shell launchers and HF/vLLM evaluation loaders are reused. Summaries
+report `low_rank_enabled: false`, zero low-rank parameter/byte counts and an
+all-zero rank schedule. Existing configurations retain rank_step=16 by default.
+
 The fitter minimizes the weighted sum of linear-output reconstruction errors
 `||(Q + L_t) Z_t - Y_t||² / N_t`. X_t and Y_t come from the FP teacher;
 Z_t is the fake-quantized/dequantized X_t using a fixed, offline-searched clip.
@@ -667,7 +681,7 @@ method:
     iterations: 3
     damp_percent: 0.001
     quantized_damping_target: update
-    low_rank_damping_target: weight
+    low_rank_damping_target: update
     loop_weights: null
     block_size: 128
     statistics_tokens_per_loop: null
@@ -731,8 +745,9 @@ and `best_iteration: 0` mean the fallback won, even if `residual_compensation` w
 Older checkpoints using `weight_update: gptaq` are migrated to the new name on load.
 
 `quantized_damping_target` and `low_rank_damping_target` independently choose `weight`
-or `update`. For Q, these add rho||Q||² or rho||Q-Q_ref||² to the reconstruction
-objective; Q_ref is FP W0 initially and the previous accepted Q later.
+or `update`, both defaulting to `update`. For Q, these add rho||Q||² or
+rho||Q-Q_ref||² to the reconstruction objective; Q_ref is FP W0 initially and
+the previous accepted Q later.
 For each low-rank branch, they add rho_t||L_t||² or rho_t||L_t-L_t,prev||². The
 latter uses zero initially, so both modes coincide in the first round. Independent
 uses H+rho I and C+rho L_t,prev in its rank-k fit. Prefix keeps L_t,prev fixed for

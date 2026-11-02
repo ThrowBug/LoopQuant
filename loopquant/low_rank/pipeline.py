@@ -53,7 +53,7 @@ class LowRankPipeline:
                 for name, module in iter_linears(block):
                     module.clip_ratios.copy_(clips[name].to(module.clip_ratios))
                     a, b = factors[name]
-                    for loop in range(config.num_loops):
+                    for loop in range(len(a)):
                         module.A[loop].copy_(a[loop])
                         module.B[loop].copy_(b[loop])
         model._quantization_algorithm = "low_rank"
@@ -67,8 +67,10 @@ class LowRankPipeline:
             "activation_allocation": list(model._loopquant_allocation),
             "weight_update": options["weight_update"], "iterations": options["iterations"],
             "stage_order": ["teacher_cache", "linear_statistics",
-                            f"alternating_{options['weight_update']}_weighted_svd"],
+                            (f"alternating_{options['weight_update']}_weighted_svd" if rank
+                             else f"quantization_{options['weight_update']}")],
             "sharing": sharing, "rank_step": rank,
+            "low_rank_enabled": rank > 0,
             "rank_schedule": [(t + 1) * rank if sharing == "prefix" else rank for t in range(config.num_loops)],
             "low_rank_parameters": sum(parameter.numel() for parameter in parameters),
             "low_rank_bytes": sum(parameter.numel() * parameter.element_size() for parameter in parameters),

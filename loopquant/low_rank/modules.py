@@ -15,6 +15,8 @@ class LowRankLinear(nn.Module):
     def __init__(self, linear, *, num_loops, rank_step, sharing, activation_bits, group_size=32):
         super().__init__()
         self.in_features, self.out_features = linear.in_features, linear.out_features
+        if isinstance(rank_step, bool) or not isinstance(rank_step, int) or rank_step < 0:
+            raise ValueError("rank_step must be a nonnegative integer")
         rank = num_loops * rank_step if sharing == "prefix" else rank_step
         if rank > min(self.in_features, self.out_features):
             raise ValueError(f"active rank exceeds linear dimensions: {self.in_features}, {self.out_features}")
@@ -28,10 +30,11 @@ class LowRankLinear(nn.Module):
         self.activation_bits, self.group_size = activation_bits, int(group_size)
         self.loop_id = 0
         self.register_buffer("clip_ratios", torch.ones(num_loops, device=linear.weight.device, dtype=torch.float32))
+        banks = num_loops if rank_step else 0
         self.A = nn.ParameterList([nn.Parameter(linear.weight.new_zeros(rank_step, self.in_features), requires_grad=False)
-                                   for _ in range(num_loops)])
+                                   for _ in range(banks)])
         self.B = nn.ParameterList([nn.Parameter(linear.weight.new_zeros(self.out_features, rank_step), requires_grad=False)
-                                   for _ in range(num_loops)])
+                                   for _ in range(banks)])
         self._inference_cache = None
 
     def _apply(self, function, recurse=True):
@@ -49,6 +52,8 @@ class LowRankLinear(nn.Module):
 
     def forward_at_loop(self, value, loop):
         value = quantize_activation(value, self.activation_bits, self.group_size, self.clip_ratios[loop])
+        if self.rank_step == 0:
+            return F.linear(value, self.weight, self.bias)
         a, b = self.factors(loop)
         correction = F.linear(F.linear(value, a.contiguous()), b.contiguous())
         return F.linear(value, self.weight, self.bias) + correction
@@ -58,7 +63,7 @@ class LowRankLinear(nn.Module):
 
     @torch.no_grad()
     def prepare_inference(self):
-        if self.sharing == "prefix":
+        if self.sharing == "prefix" and self.rank_step:
             a, b = torch.cat(tuple(self.A), 0), torch.cat(tuple(self.B), 1)
             self._inference_cache = {
                 loop: (a[:(loop + 1) * self.rank_step], b[:, :(loop + 1) * self.rank_step].contiguous())

@@ -258,7 +258,7 @@ def test_inconsistent_residual_energy_is_not_silently_clamped():
 
 
 @pytest.mark.parametrize("q_target", ["weight", "update"])
-@pytest.mark.parametrize("low_rank_target", ["weight", "update"])
+@pytest.mark.parametrize("low_rank_target", ["weight", "update", None])
 def test_all_damping_target_combinations_match_normal_equations(monkeypatch, q_target, low_rank_target):
     import loopquant.low_rank.solver as solver
     torch.manual_seed(29)
@@ -284,7 +284,10 @@ def test_all_damping_target_combinations_match_normal_equations(monkeypatch, q_t
     options = {"weight_update": "regression_gptq", "iterations": 3, "damp_percent": 0.1,
                "loop_weights": None, "block_size": 32,
                "quantized_damping_target": q_target, "low_rank_damping_target": low_rank_target}
+    if low_rank_target is None:
+        options.pop("low_rank_damping_target")
     _, _, _, report = solve_linear(w, stats, rank=4, options=options, group_size=2)
+    assert report["low_rank_damping_target"] == (low_rank_target or "update")
     assert len(low_rank_calls) >= 2  # the update reference matters after the first round
     h = stats["hessian"][0]
     d = y[0].double() @ z[0].double().T / 50
@@ -297,7 +300,7 @@ def test_all_damping_target_combinations_match_normal_equations(monkeypatch, q_t
                                         (d - previous_l @ h + q_rho * q_reference).T).T
         torch.testing.assert_close(continuous, expected_q, rtol=1e-12, atol=1e-14)
         stored_q = continuous.to(w.dtype).double()
-        l_reference = previous_l if low_rank_target == "update" else torch.zeros_like(previous_l)
+        l_reference = previous_l if low_rank_target != "weight" else torch.zeros_like(previous_l)
         expected_cross = d - stored_q @ h + l_rho * l_reference
         torch.testing.assert_close(cross, expected_cross, rtol=1e-12, atol=1e-14)
         # Full output rank makes the low-rank solve an independently checkable ridge solution.

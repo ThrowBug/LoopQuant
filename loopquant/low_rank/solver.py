@@ -150,9 +150,11 @@ def reconstruction_loss(weight, a, b, statistics, loop_weights, *, reference, sh
     from intermediate BF16 GEMM rounding and upstream student-state drift.
     """
     losses = []
-    for loop in range(len(a)):
-        loop_a, loop_b = _loop_factors(a, b, loop, sharing)
-        delta = weight.double() - reference.double() + loop_b @ loop_a
+    for loop in range(len(statistics["hessian"])):
+        delta = weight.double() - reference.double()
+        if a:
+            loop_a, loop_b = _loop_factors(a, b, loop, sharing)
+            delta = delta + loop_b @ loop_a
         quadratic = ((delta @ statistics["hessian"][loop]) * delta).sum()
         cross = (delta * statistics["residual_cross"][loop]).sum()
         energy = statistics["residual_energy"][loop]
@@ -178,7 +180,7 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
     if weight_update not in ("regression_gptq", "residual_compensation"):
         raise ValueError("solver.weight_update must be regression_gptq or residual_compensation")
     q_target = options.get("quantized_damping_target", "update")
-    low_rank_target = options.get("low_rank_damping_target", "weight")
+    low_rank_target = options.get("low_rank_damping_target", "update")
     if q_target not in ("weight", "update") or low_rank_target not in ("weight", "update"):
         raise ValueError("damping targets must be weight or update")
     device, dtype = weight.device, weight.dtype
@@ -188,8 +190,10 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
         raise ValueError(f"non-finite calibration residual statistics: {label}")
     original = weight.detach().double()
     loops = len(hessians)
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+        raise ValueError("rank must be a nonnegative integer")
     active_rank = rank * loops if sharing == "prefix" else rank
-    if rank <= 0 or active_rank > min(weight.shape):
+    if active_rank > min(weight.shape):
         raise ValueError("active low-rank schedule exceeds the linear dimensions")
     weights = torch.tensor(options["loop_weights"] or [1.0] * loops, device=device, dtype=torch.float64)
     weights /= weights.sum()
@@ -201,7 +205,9 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
     inverse_factor = inverse_factor64.float()
     if weight_update != "residual_compensation":
         inverse_factor64 = None
-    if sharing == "prefix":
+    if rank == 0:
+        factors, l_damping, suffix_damping = [], [], []
+    elif sharing == "prefix":
         factors, l_damping, suffix_damping = _prefix_factors(
             hessians, weights, options["damp_percent"], logger=logger, label=label)
     else:
@@ -209,28 +215,33 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
             h, options["damp_percent"], logger=logger, label=f"{label} loop={loop + 1}")
             for loop, h in enumerate(hessians)))
 
-    # A feasible weight-only baseline participates in selection too. It uses
+    # GPTQ (plus weight-error SVD when enabled) participates in selection too. It uses
     # the same Z Gram and clip as the alternating candidates (not the old X Gram).
     baseline_q = gptq(original, shared_hessian, bits=bits, group_size=group_size,
                       block_size=options["block_size"], inverse_factor=inverse_factor).to(dtype)
-    baseline_a, baseline_b = svd_factors(original - baseline_q.double(), active_rank)
-    if sharing == "prefix":
-        baseline_a = [value.to(dtype) for value in baseline_a.split(rank, 0)]
-        baseline_b = [value.to(dtype) for value in baseline_b.split(rank, 1)]
+    if rank == 0:
+        baseline_a, baseline_b = [], []
     else:
-        baseline_a = [baseline_a.to(dtype) for _ in range(loops)]
-        baseline_b = [baseline_b.to(dtype) for _ in range(loops)]
+        baseline_a, baseline_b = svd_factors(original - baseline_q.double(), active_rank)
+        if sharing == "prefix":
+            baseline_a = [value.to(dtype) for value in baseline_a.split(rank, 0)]
+            baseline_b = [value.to(dtype) for value in baseline_b.split(rank, 1)]
+        else:
+            baseline_a = [baseline_a.to(dtype) for _ in range(loops)]
+            baseline_b = [baseline_b.to(dtype) for _ in range(loops)]
     baseline_loss, _ = reconstruction_loss(
         baseline_q, baseline_a, baseline_b, stats, weights, reference=original, sharing=sharing)
     best = baseline_q, baseline_a, baseline_b, baseline_loss, 0
     if logger is not None:
-        logger.info("[LowRank] %s weight-only baseline loss=%.6g weight_update=%s sharing=%s "
+        logger.info("[LowRank] %s %s baseline loss=%.6g weight_update=%s sharing=%s "
                     "quantized_damping_target=%s low_rank_damping_target=%s",
-                    label, baseline_loss, weight_update, sharing, q_target, low_rank_target)
+                    label, "weight-only" if rank else "GPTQ-only", baseline_loss,
+                    weight_update, sharing, q_target, low_rank_target)
 
     # The first alternating round still starts with L_t=0 and FP W as reference.
-    a = [torch.zeros(rank, weight.shape[1], device=device, dtype=dtype) for _ in range(loops)]
-    b = [torch.zeros(weight.shape[0], rank, device=device, dtype=dtype) for _ in range(loops)]
+    banks = loops if rank else 0
+    a = [torch.zeros(rank, weight.shape[1], device=device, dtype=dtype) for _ in range(banks)]
+    b = [torch.zeros(weight.shape[0], rank, device=device, dtype=dtype) for _ in range(banks)]
     reference, history, previous_loss = original, [], None
     for iteration in range(1, options["iterations"] + 1):
         q_reference = reference if q_target == "update" else torch.zeros_like(original)
@@ -240,9 +251,10 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
             # Negative half-gradient at W0, including the chosen ridge reference.
             # Keep it centered; never reconstruct a large Y Z' cross moment.
             adjusted = shared_cross + q_damping * (q_reference - original)
-        for loop in range(loops):
-            loop_a, loop_b = _loop_factors(a, b, loop, sharing)
-            adjusted.addmm_(loop_b, loop_a @ hessians[loop], alpha=-float(weights[loop]))
+        if rank:
+            for loop in range(loops):
+                loop_a, loop_b = _loop_factors(a, b, loop, sharing)
+                adjusted.addmm_(loop_b, loop_a @ hessians[loop], alpha=-float(weights[loop]))
         if weight_update == "regression_gptq":
             continuous = q_reference + continuous_weight(adjusted, shared_factor)
             candidate = gptq(continuous, shared_hessian, bits=bits, group_size=group_size,
@@ -252,7 +264,9 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
                                                block_size=options["block_size"], inverse_factor=inverse_factor64)
         # Match the final saved base dtype before computing its low-rank residual.
         candidate = candidate.to(dtype)
-        if sharing == "prefix":
+        if rank == 0:
+            next_a, next_b, prefix_updates = [], [], []
+        elif sharing == "prefix":
             next_a, next_b, prefix_updates = _update_prefix(
                 candidate, original, a, b, stats, weights, factors, l_damping, low_rank_target,
                 logger=logger, label=label)
@@ -298,6 +312,7 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
               "weight_update_implementation": ("continuous_regression_gptq" if weight_update == "regression_gptq"
                                                 else weight_update),
               "selected_candidate": "baseline" if iteration == 0 else weight_update,
+              "low_rank_enabled": rank > 0,
               "sharing": sharing,
               "rank_schedule": [(t + 1) * rank if sharing == "prefix" else rank for t in range(loops)],
               "quantized_damping_target": q_target, "low_rank_damping_target": low_rank_target,
