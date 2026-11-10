@@ -605,8 +605,11 @@ supply a matching `--num-loops`. Low-rank vLLM currently uses `cached` execution
 original LoopQuant `compiled`/`fast` modes are not enabled for this new method.
 No dependency changes or low-bit kernels are required for this path.
 
-Each of the seven attention/MLP projections contains one shared W4/G32 base Q
-and T stored rank-k pairs B_j A_j. `method.rank_step` is k; `num_loops` is T.
+Each of the seven attention/MLP projections contains one shared W4 group-wise base Q
+and T stored rank-k pairs B_j A_j. The default `quantization.group_size` is 32;
+positive integers select that many input channels per weight/activation group, while
+`null` uses one full input-width group (per-token activations and per-output-channel
+weight rows). `method.rank_step` is k; `num_loops` is T.
 With `sharing: independent`, loop t uses L_t=B_t A_t. With `sharing: prefix`,
 it uses L_t=sum_{j<=t} B_j A_j, equivalently the first tk columns/rows of the
 concatenated factors. Both store Tk(m+n) low-rank parameters for a matrix of
@@ -638,8 +641,9 @@ decoder-block reconstruction or end-to-end training.
 
 1. Cache immutable FP teacher trajectories and original projection weights.
 2. Fit per-module/per-loop clipping by activation MSE. Activation quantization
-   remains dynamic symmetric G32: [-7,7] for A4 or [-127,127] for A8. Both the
-   base and low-rank branch consume the same Z_t; the correction is not requantized.
+   remains dynamic symmetric group-wise: [-7,7] for A4 or [-127,127] for A8.
+   Both the base and low-rank branch consume the same Z_t; the correction is not
+   requantized.
 3. Replay each unmodified FP block with the original teacher collection batch
    shapes. With original weight W0, form R0_t=Y_t-W0 Z_t directly and collect
    H_t=Z_t Z_t'/N_t, K_t=R0_t Z_t'/N_t and ||R0_t||²/N_t entirely in FP64.

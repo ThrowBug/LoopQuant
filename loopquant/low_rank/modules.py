@@ -6,13 +6,15 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from ..grouping import GroupSize, validate_input_width
 from .quantization import activation_bits, quantize_activation
 
 TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 
 
 class LowRankLinear(nn.Module):
-    def __init__(self, linear, *, num_loops, rank_step, sharing, activation_bits, group_size=32):
+    def __init__(self, linear, *, num_loops, rank_step, sharing, activation_bits,
+                 group_size: GroupSize = 32):
         super().__init__()
         self.in_features, self.out_features = linear.in_features, linear.out_features
         if isinstance(rank_step, bool) or not isinstance(rank_step, int) or rank_step < 0:
@@ -27,7 +29,8 @@ class LowRankLinear(nn.Module):
         self.num_loops, self.rank_step, self.sharing = int(num_loops), int(rank_step), sharing
         if isinstance(activation_bits, bool) or not isinstance(activation_bits, int) or activation_bits not in (4, 8):
             raise ValueError("low_rank requires a uniform activation precision of 4 or 8 bits")
-        self.activation_bits, self.group_size = activation_bits, int(group_size)
+        validate_input_width(self.in_features, group_size, name="low-rank input width")
+        self.activation_bits, self.group_size = activation_bits, group_size
         self.loop_id = 0
         self.register_buffer("clip_ratios", torch.ones(num_loops, device=linear.weight.device, dtype=torch.float32))
         banks = num_loops if rank_step else 0

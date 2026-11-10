@@ -7,6 +7,8 @@ decomposition, which cannot be recovered from output cross moments alone.
 
 import torch
 
+from ..grouping import GroupSize, effective_group_size, validate_input_width
+
 
 def _weight_scale(group, qmax):
     """Same symmetric group MSE search as the existing GPTQ implementation."""
@@ -19,7 +21,7 @@ def _weight_scale(group, qmax):
 
 @torch.no_grad()
 def residual_compensation(weight, residual_cross, *, inverse_factor, bits=4,
-                          group_size=32, block_size=128):
+                          group_size: GroupSize = 32, block_size=128):
     """Quantize W0 directly, then compensate remaining weights for a fixed E.
 
     For J(V)=sum_t lambda_t ||V Z_t-E_t||^2/N_t + rho||V-S||^2,
@@ -40,10 +42,11 @@ def residual_compensation(weight, residual_cross, *, inverse_factor, bits=4,
     if weight.ndim != 2 or residual_cross.shape != weight.shape:
         raise ValueError("residual compensation weight and residual_cross must be matching matrices")
     width = weight.shape[1]
+    validate_input_width(width, group_size, name="weight width")
     if inverse_factor.shape != (width, width):
         raise ValueError("residual compensation inverse_factor must match the input width")
-    if block_size <= 0 or group_size <= 0:
-        raise ValueError("residual compensation block_size and group_size must be positive")
+    if block_size <= 0:
+        raise ValueError("residual compensation block_size must be positive")
     if (not torch.isfinite(weight).all() or not torch.isfinite(residual_cross).all()
             or not torch.isfinite(inverse_factor).all() or (inverse_factor.diag() <= 0).any()):
         raise ValueError("residual compensation requires finite inputs and a positive inverse-factor diagonal")
@@ -57,6 +60,7 @@ def residual_compensation(weight, residual_cross, *, inverse_factor, bits=4,
             raise FloatingPointError("non-finite residual compensation")
     result = torch.empty_like(work)
     qmax = 2 ** (bits - 1) - 1
+    resolved_group_size = effective_group_size(group_size, width)
     scale = None
     for start in range(0, width, block_size):
         stop = min(start + block_size, width)
@@ -64,8 +68,8 @@ def residual_compensation(weight, residual_cross, *, inverse_factor, bits=4,
         errors = torch.zeros_like(block)
         for local in range(stop - start):
             column = start + local
-            if column % group_size == 0:
-                group = work[:, column:column + group_size].clone()
+            if column % resolved_group_size == 0:
+                group = work[:, column:column + resolved_group_size].clone()
                 overlap = min(group.shape[1], stop - column)
                 group[:, :overlap] = block[:, local:local + overlap]
                 scale = _weight_scale(group, qmax)

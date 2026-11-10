@@ -4,6 +4,7 @@ import math
 
 import torch
 
+from ..grouping import GroupSize, validate_input_width
 from .quantization import gptq
 from .residual_compensation import residual_compensation
 
@@ -171,7 +172,7 @@ def reconstruction_loss(weight, a, b, statistics, loop_weights, *, reference, sh
 
 
 @torch.no_grad()
-def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
+def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: GroupSize = 32,
                  sharing="independent", logger=None, label=""):
     """Fit shared Q with independent corrections or cumulative rank-k increments."""
     if sharing not in ("independent", "prefix"):
@@ -183,6 +184,9 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size=32,
     low_rank_target = options.get("low_rank_damping_target", "update")
     if q_target not in ("weight", "update") or low_rank_target not in ("weight", "update"):
         raise ValueError("damping targets must be weight or update")
+    if weight.ndim != 2:
+        raise ValueError("solve_linear weight must be a matrix")
+    validate_input_width(weight.shape[1], group_size, name=f"{label or 'linear'} weight width")
     device, dtype = weight.device, weight.dtype
     stats = {name: value.to(device=device, dtype=torch.float64) for name, value in statistics.items()}
     hessians, crosses = stats["hessian"], stats["residual_cross"]

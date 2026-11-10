@@ -44,7 +44,7 @@ class LoopQuantPipeline:
             raise ValueError("CLDC is a required LoopQuant component")
         self.logger.info("[CLDC] Cross-loop distribution canonicalization")
         self.cldc = CrossLoopDistributionCanonicalization(
-            group_size=int(self.config.quantization["group_size"]),
+            group_size=self.config.quantization["group_size"],
             optimization_steps=int(options.get("optimization_steps", 80)),
             learning_rate=float(options.get("learning_rate", 1e-3)),
             rotation_seed=int(options.get("rotation_seed", 42)),
@@ -100,7 +100,7 @@ class LoopQuantPipeline:
         )
         self.lctc = LoopConditionedTaskCalibration(
             num_loops=int(self.config.num_loops),
-            group_size=int(self.config.quantization["group_size"]),
+            group_size=self.config.quantization["group_size"],
             updates=int(options.get("updates", 192)),
             learning_rate=float(options.get("learning_rate", 1e-3)),
             task_objective_weight=float(options.get("task_objective_weight", 0.03)),

@@ -14,6 +14,7 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, Genera
 from transformers.dynamic_module_utils import custom_object_save
 
 from .evaluation_results import save_json
+from .grouping import validate_group_size
 from .lctc import LoopConditionedCGB, apply_lctc_calibration
 from .models import configure_looped_model
 from .quantization import QUANTIZATION_CONTEXT, QuantizedLinear, _RotatedRMSNorm
@@ -203,7 +204,12 @@ def _restore_structure(model, manifest):
             original.in_features != spec["in_features"] or original.out_features != spec["out_features"]
         ):
             raise ValueError(f"checkpoint linear structure mismatch: {path}")
-        replacement = QuantizedLinear(original, spec["name"], spec["group_size"])
+        # Checkpoints written before nullable group sizes existed have no
+        # ambiguity: their public path was G32. Keep that compatibility while
+        # preserving an explicit null in new manifests.
+        group_size = spec.get("group_size", 32)
+        validate_group_size(group_size, name=f"checkpoint {path}.group_size")
+        replacement = QuantizedLinear(original, spec["name"], group_size)
         replacement.cldc_hadamard = spec["cldc_hadamard"]
         if spec["has_scale"]:
             replacement.cldc_scale = nn.Parameter(torch.empty(
@@ -211,7 +217,15 @@ def _restore_structure(model, manifest):
         replacement.cldc_permutation = torch.empty(spec["permutation_size"], dtype=torch.long, device="meta")
         model.set_submodule(path, replacement)
     if manifest["has_lctc"]:
-        model.lctc_cgb = LoopConditionedCGB.from_model(model, manifest["num_loops"])
+        group_sizes = [spec.get("group_size", 32) for spec in manifest["linears"]]
+        if not group_sizes:
+            raise ValueError("LCTC checkpoint has no quantized linear metadata")
+        if any(value != group_sizes[0] for value in group_sizes[1:]):
+            raise ValueError("checkpoint quantized linears use inconsistent group sizes")
+        validate_group_size(group_sizes[0], name="checkpoint group_size")
+        model.lctc_cgb = LoopConditionedCGB.from_model(
+            model, manifest["num_loops"], group_size=group_sizes[0]
+        )
 
 
 def read_checkpoint_manifest(path, *, num_loops=None):

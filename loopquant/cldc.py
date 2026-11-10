@@ -25,6 +25,7 @@ from .quantization import (
     rotate_ouro_backbone,
     wrap_quantized_modules,
 )
+from .grouping import GroupSize, validate_group_size
 
 
 def _normalized_mse(prediction: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
@@ -196,13 +197,13 @@ class CrossLoopDistributionCanonicalization:
     def __init__(
         self,
         *,
-        group_size: int = 32,
+        group_size: GroupSize = 32,
         optimization_steps: int = 80,
         learning_rate: float = 1e-3,
         rotation_seed: int = 42,
         statistics_sequences: int = 16,
     ):
-        self.group_size = int(group_size)
+        self.group_size = validate_group_size(group_size)
         self.optimization_steps = int(optimization_steps)
         self.learning_rate = float(learning_rate)
         self.rotation_seed = int(rotation_seed)

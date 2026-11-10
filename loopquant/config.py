@@ -10,6 +10,8 @@ from typing import Any
 
 import yaml
 
+from .grouping import validate_group_size
+
 DEFAULTS: dict[str, Any] = {
     "algorithm": "loopquant",
     "model_family": "ouro",
@@ -153,8 +155,9 @@ class LoopQuantConfig:
                 f"{self.model_family} formal runs require num_loops={expected_loops}"
             )
         q = self.quantization
-        if int(q["weight_bits"]) != 4 or int(q["group_size"]) != 32:
-            raise ValueError("the validated public path is W4 with group size 32")
+        if int(q["weight_bits"]) != 4:
+            raise ValueError("the validated public path uses W4 weights")
+        validate_group_size(q.get("group_size"))
         setting = str(q["activation_setting"]).lower()
         settings = ("w4a4", "w4a8") if self.algorithm == "low_rank" else ("w4a4", "w4a6")
         if setting not in settings:
@@ -228,9 +231,12 @@ class LoopQuantConfig:
 
     def apply_overrides(self, **values: Any) -> None:
         for key, value in values.items():
-            if value is None:
-                continue
             section, _, name = key.partition("__")
+            # ``quantization.group_size: null`` is a valid, explicit request
+            # for one full input-width group. Other ``None`` values are CLI
+            # sentinels meaning that the optional flag was omitted.
+            if value is None and not (section == "quantization" and name == "group_size"):
+                continue
             if name:
                 getattr(self, section)[name] = value
             else:

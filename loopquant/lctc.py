@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import importlib
-import math
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -21,7 +20,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
+from .grouping import (
+    GroupSize,
+    activation_group_count,
+    effective_group_size,
+    output_group_count,
+    validate_group_size,
+    validate_input_width,
+)
 from .quantization import QUANTIZATION_CONTEXT, QuantizedLinear, round_ste
+
+
+_GROUP_SIZE_UNSET = object()
 
 
 @dataclass(frozen=True)
@@ -31,6 +41,7 @@ class _CGBSpec:
     input_groups: int
     output_groups: int
     out_features: int
+    output_group_size: int
 
 
 class _CGBEntry(nn.Module):
@@ -44,17 +55,18 @@ class _CGBEntry(nn.Module):
         self.register_buffer("clip_initial", torch.ones(spec.input_groups, dtype=torch.float32), persistent=True)
 
     def expanded(self, value: torch.Tensor, width: int, device: torch.device) -> torch.Tensor:
-        return value.to(device=device, dtype=torch.float32).repeat_interleave(32)[:width]
+        return value.to(device=device, dtype=torch.float32).repeat_interleave(
+            self.spec.output_group_size
+        )[:width]
 
 
 class LoopConditionedCGB(nn.Module):
     """Static clipping/gain/bias parameters for every module and recurrent loop."""
 
-    def __init__(self, specs: Iterable[_CGBSpec], group_size: int = 32):
+    def __init__(self, specs: Iterable[_CGBSpec], group_size: GroupSize = 32):
         super().__init__()
-        if int(group_size) != 32:
-            raise ValueError("the validated LCTC deployment uses group size 32")
-        self.group_size = int(group_size)
+        validate_group_size(group_size)
+        self.group_size = group_size
         self.entries = nn.ModuleDict()
         self._lookup: dict[tuple[str, int], str] = {}
         self._specs: dict[str, _CGBSpec] = {}
@@ -67,19 +79,41 @@ class LoopConditionedCGB(nn.Module):
             self._specs[key] = spec
 
     @classmethod
-    def from_model(cls, model: nn.Module, num_loops: int, group_size: int = 32) -> "LoopConditionedCGB":
+    def from_model(
+        cls,
+        model: nn.Module,
+        num_loops: int,
+        group_size: GroupSize | object = _GROUP_SIZE_UNSET,
+    ) -> "LoopConditionedCGB":
+        # Omitting the argument means “recover the module metadata”, while an
+        # explicit ``None`` means the public full-width/per-token mode.
+        if group_size is _GROUP_SIZE_UNSET:
+            group_size = next(
+                (module.group_size for module in model.modules() if isinstance(module, QuantizedLinear)),
+                32,
+            )
+        validate_group_size(group_size)
         specs = []
         for name, module in model.named_modules():
             if not isinstance(module, QuantizedLinear):
                 continue
+            if module.group_size != group_size:
+                raise ValueError(
+                    f"LCTC group_size {group_size!r} does not match {module.name or name} "
+                    f"metadata {module.group_size!r}"
+                )
+            input_groups = activation_group_count(module.in_features, group_size)
+            output_groups = output_group_count(module.out_features, module.in_features, group_size)
+            output_group_size = 1 if group_size is None else group_size
             for loop_id in range(int(num_loops)):
                 specs.append(
                     _CGBSpec(
                         module_name=module.name or name,
                         loop_id=loop_id,
-                        input_groups=math.ceil(module.in_features / group_size),
-                        output_groups=math.ceil(module.out_features / group_size),
+                        input_groups=input_groups,
+                        output_groups=output_groups,
                         out_features=module.out_features,
+                        output_group_size=output_group_size,
                     )
                 )
         return cls(specs, group_size)
@@ -134,19 +168,19 @@ def _fake_quantize_with_group_clip(
     value: torch.Tensor,
     bits: int,
     clip: torch.Tensor,
-    group_size: int = 32,
+    group_size: GroupSize = 32,
     eps: float = 1e-8,
 ) -> torch.Tensor:
     if bits >= 16:
         return value
     width = value.shape[-1]
-    if width % group_size:
-        raise ValueError(f"last dimension {width} is not divisible by group size {group_size}")
-    groups = width // group_size
+    validate_input_width(width, group_size, name="last dimension")
+    resolved = effective_group_size(group_size, width)
+    groups = width // resolved
     if clip.numel() != groups:
         raise ValueError(f"clip group count {clip.numel()} does not match {groups}")
     original_dtype = value.dtype
-    grouped = value.float().reshape(-1, groups, group_size)
+    grouped = value.float().reshape(-1, groups, resolved)
     ratio = clip.to(value.device).reshape(1, groups, 1)
     qmax = 2 ** (int(bits) - 1) - 1
     scale = grouped.abs().amax(-1, keepdim=True).clamp_min(eps) * ratio / qmax
@@ -191,7 +225,7 @@ def _activate_runtime(runtime: _LCTCRuntime | None) -> Iterator[None]:
 def initialize_loop_conditioned_cgb(
     model: nn.Module,
     num_loops: int,
-    group_size: int = 32,
+    group_size: GroupSize = 32,
 ) -> LoopConditionedCGB:
     """Create neutral static LCTC parameters for all quantized module-loop pairs."""
     return LoopConditionedCGB.from_model(model, num_loops, group_size)
@@ -273,10 +307,11 @@ def _initialize_from_local_reconstruction(
         entry.clip.fill_(best_ratio)
         entry.clip_initial.fill_(best_ratio)
         width = reference.shape[-1]
-        groups = math.ceil(width / cgb.group_size)
-        if width % cgb.group_size:
-            reference = F.pad(reference, (0, groups * cgb.group_size - width))
-        sigma = reference.reshape(-1, groups, cgb.group_size).square().mean((0, 2)).sqrt().clamp_min(1e-6)
+        output_group_size = entry.spec.output_group_size
+        groups = entry.spec.output_groups
+        if width % output_group_size:
+            reference = F.pad(reference, (0, groups * output_group_size - width))
+        sigma = reference.reshape(-1, groups, output_group_size).square().mean((0, 2)).sqrt().clamp_min(1e-6)
         entry.sigma.copy_(sigma)
 
 
@@ -549,7 +584,7 @@ class LoopConditionedTaskCalibration:
         self,
         num_loops: int,
         *,
-        group_size: int = 32,
+        group_size: GroupSize = 32,
         updates: int = 192,
         learning_rate: float = 1e-3,
         task_objective_weight: float = 0.03,
@@ -563,7 +598,7 @@ class LoopConditionedTaskCalibration:
         objective: Callable = compute_task_transport_secant_loss,
     ):
         self.num_loops = int(num_loops)
-        self.group_size = int(group_size)
+        self.group_size = validate_group_size(group_size)
         self.updates = int(updates)
         self.learning_rate = float(learning_rate)
         self.task_objective_weight = float(task_objective_weight)

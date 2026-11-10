@@ -1,4 +1,4 @@
-"""Validated G32 weight and activation fake-quantization primitives."""
+"""Group-wise weight and activation fake-quantization primitives."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .grouping import GroupSize, effective_group_size, validate_input_width
+
 
 def round_ste(value: torch.Tensor) -> torch.Tensor:
     return (value.round() - value).detach() + value
@@ -19,7 +21,7 @@ def round_ste(value: torch.Tensor) -> torch.Tensor:
 def fake_quantize_groupwise(
     value: torch.Tensor,
     bits: int,
-    group_size: int = 32,
+    group_size: GroupSize = 32,
     clip_ratio: float | torch.Tensor = 1.0,
     eps: float = 1e-8,
 ) -> torch.Tensor:
@@ -27,12 +29,12 @@ def fake_quantize_groupwise(
     if bits >= 16:
         return value
     width = value.shape[-1]
-    if width % group_size:
-        raise ValueError(f"last dimension {width} is not divisible by group size {group_size}")
+    validate_input_width(width, group_size, name="last dimension")
+    resolved = effective_group_size(group_size, width)
     original_dtype = value.dtype
-    grouped = value.float().reshape(-1, width // group_size, group_size)
+    grouped = value.float().reshape(-1, width // resolved, resolved)
     ratio = torch.as_tensor(clip_ratio, device=grouped.device, dtype=grouped.dtype)
-    if ratio.ndim == 1 and ratio.numel() == width // group_size:
+    if ratio.ndim == 1 and ratio.numel() == width // resolved:
         ratio = ratio.reshape(1, -1, 1)
     qmax = 2 ** (int(bits) - 1) - 1
     scale = grouped.abs().amax(dim=-1, keepdim=True).clamp_min(eps) * ratio / qmax
@@ -40,14 +42,14 @@ def fake_quantize_groupwise(
     return quantized.reshape_as(value).to(original_dtype)
 
 
-def fake_quantize_weight(weight: torch.Tensor, bits: int = 4, group_size: int = 32) -> torch.Tensor:
+def fake_quantize_weight(weight: torch.Tensor, bits: int = 4, group_size: GroupSize = 32) -> torch.Tensor:
     return fake_quantize_groupwise(weight, bits=bits, group_size=group_size)
 
 
 def fake_quantize_activation(
     activation: torch.Tensor,
     bits: int,
-    group_size: int = 32,
+    group_size: GroupSize = 32,
     clip_ratio: float | torch.Tensor = 1.0,
 ) -> torch.Tensor:
     return fake_quantize_groupwise(activation, bits=bits, group_size=group_size, clip_ratio=clip_ratio)
@@ -120,10 +122,12 @@ class GPTQWeightReconstruction:
         self,
         block_size: int = 128,
         damp_percent: float = 0.01,
-        group_size: int = 32,
+        group_size: GroupSize = 32,
         activation_order: bool = False,
     ) -> None:
         weight = self.module.weight.data.clone().float()
+        validate_input_width(weight.shape[1], group_size, name="weight width")
+        resolved_group_size = effective_group_size(group_size, weight.shape[1])
         self.quantizer.find_params(weight)
         hessian = self.hessian
         dead = torch.diag(hessian) == 0
@@ -151,8 +155,10 @@ class GPTQWeightReconstruction:
             for offset in range(stop - start):
                 column = block[:, offset]
                 divisor = local_inverse[offset, offset]
-                if group_size != -1 and (start + offset) % group_size == 0:
-                    self.quantizer.find_params(weight[:, start + offset : start + offset + group_size])
+                if (start + offset) % resolved_group_size == 0:
+                    self.quantizer.find_params(
+                        weight[:, start + offset : start + offset + resolved_group_size]
+                    )
                 quantized = self.quantizer.quantize(column[:, None]).flatten()
                 quantized_block[:, offset] = quantized
                 error = (column - quantized) / divisor
@@ -172,7 +178,7 @@ def quantize_weights_gptq(
     calibration_data: Iterable[torch.Tensor],
     device: str,
     bits: int = 4,
-    group_size: int = 32,
+    group_size: GroupSize = 32,
     damp_percent: float = 0.01,
     activation_order: bool = False,
 ) -> dict[str, object]:
@@ -347,14 +353,15 @@ TARGET_SUFFIXES = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj
 class QuantizedLinear(nn.Module):
     """Linear layer with shared W4 weights and loop-selected A4/A8 fake quantization."""
 
-    def __init__(self, linear: nn.Linear, name: str, group_size: int = 32):
+    def __init__(self, linear: nn.Linear, name: str, group_size: GroupSize = 32):
         super().__init__()
         self.name = name
         self.in_features = linear.in_features
         self.out_features = linear.out_features
         self.weight = linear.weight
         self.bias = linear.bias
-        self.group_size = int(group_size)
+        validate_input_width(self.in_features, group_size, name=f"{name} input width")
+        self.group_size = group_size
         self.cldc_hadamard = False
         self.cldc_scale: nn.Parameter | None = None
         self.register_buffer("cldc_permutation", torch.empty(0, dtype=torch.long), persistent=True)
@@ -400,7 +407,7 @@ def is_quantization_target(name: str) -> bool:
     return not any(part in name for part in ("lm_head", "embed", "early_exit")) and name.endswith(TARGET_SUFFIXES)
 
 
-def wrap_quantized_modules(model: nn.Module, group_size: int = 32) -> dict[str, QuantizedLinear]:
+def wrap_quantized_modules(model: nn.Module, group_size: GroupSize = 32) -> dict[str, QuantizedLinear]:
     wrapped: dict[str, QuantizedLinear] = {}
     for name, module in list(model.named_modules()):
         if not isinstance(module, nn.Linear) or not is_quantization_target(name):

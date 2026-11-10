@@ -5,6 +5,7 @@ import logging
 import torch
 
 from ..methods import QuantizationResult
+from ..grouping import validate_input_width
 from .cache import prepare_teacher_cache, block_statistics, original_linears
 from .modules import wrap_linears, iter_linears, prepare_inference
 from .quantization import activation_bits
@@ -27,8 +28,11 @@ class LowRankPipeline:
             for module in original_linears(block).values():
                 if active_rank > min(module.weight.shape):
                     raise ValueError("active low-rank schedule exceeds a target projection's dimensions")
-                if module.in_features % config.quantization["group_size"]:
-                    raise ValueError("target input width is not divisible by group_size")
+                validate_input_width(
+                    module.in_features,
+                    config.quantization["group_size"],
+                    name="target input width",
+                )
         teacher = prepare_teacher_cache(model, tokenizer, calibration_data, config, self.device, self.logger)
         fitted, history = [], []
         rank = config.method["rank_step"]

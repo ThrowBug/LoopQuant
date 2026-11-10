@@ -7,6 +7,7 @@ from accelerate import init_empty_weights
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 
 from ..config import LoopQuantConfig
+from ..grouping import validate_group_size
 from ..models import configure_looped_model
 from .modules import LowRankLinear, wrap_linears, prepare_inference
 from .quantization import activation_bits
@@ -78,14 +79,24 @@ def restore_structure(model, manifest):
              if config.method["sharing"] == "prefix" else [config.method["rank_step"]] * config.num_loops)
     if ranks != manifest["rank_schedule"]:
         raise ValueError("low_rank rank schedule metadata disagrees")
+    validate_group_size(config.quantization.get("group_size"), name="checkpoint group_size")
     wrap_linears(model, config)
     actual = {name: module for name, module in model.named_modules() if isinstance(module, LowRankLinear)}
     if set(actual) != {spec["path"] for spec in manifest["linears"]}:
         raise ValueError("low_rank checkpoint linear paths differ")
     for spec in manifest["linears"]:
         module = actual[spec["path"]]
-        if any(getattr(module, key) != spec[key]
-               for key in ("in_features", "out_features", "sharing", "rank_step", "group_size")):
+        saved = {
+            "in_features": spec["in_features"],
+            "out_features": spec["out_features"],
+            "sharing": spec["sharing"],
+            "rank_step": spec["rank_step"],
+            # Legacy low-rank snapshots were always the public G32 path and
+            # may omit this field. New snapshots preserve explicit null.
+            "group_size": spec.get("group_size", 32),
+        }
+        validate_group_size(saved["group_size"], name=f"checkpoint {spec['path']}.group_size")
+        if any(getattr(module, key) != value for key, value in saved.items()):
             raise ValueError(f"low_rank linear metadata differs: {spec['path']}")
     model._quantization_algorithm = "low_rank"
     model._low_rank_config = config.to_dict()

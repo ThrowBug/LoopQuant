@@ -16,13 +16,26 @@ from .models import load_looped_transformer, load_model_for_evaluation
 from .utils import resolve_device, runtime_metadata, set_random_seed, setup_logging, write_json, write_yaml
 
 
+def _parse_group_size(value: str):
+    if str(value).strip().lower() in {"none", "null"}:
+        return None
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("group size must be a positive integer or null") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("group size must be a positive integer or null")
+    return parsed
+
+
 def _add_quantize_arguments(parser):
     parser.add_argument("--config", required=True, help="Quantization/calibration YAML")
     parser.add_argument("--save", action="store_true", help="Save output-dir/checkpoint before evaluation")
     parser.add_argument("--model-family", choices=("ouro", "nanbeige", "huginn"))
     parser.add_argument("--weight-bits", type=int)
     parser.add_argument("--activation-setting", choices=("w4a4", "w4a6", "w4a8"))
-    parser.add_argument("--group-size", type=int)
+    parser.add_argument("--group-size", type=_parse_group_size, default=argparse.SUPPRESS,
+                        help="Weight/activation group size, or null for per-token/per-output-channel quantization")
     parser.add_argument("--num-calibration-samples", type=int)
     parser.add_argument("--calibration-seqlen", type=int)
     parser.add_argument("--calibration-seed", type=int)
@@ -76,7 +89,7 @@ def _run_quantize(args):
         model_family=args.model_family, output_dir=args.output_dir,
         quantization__weight_bits=args.weight_bits,
         quantization__activation_setting=args.activation_setting,
-        quantization__group_size=args.group_size,
+        **({"quantization__group_size": args.group_size} if hasattr(args, "group_size") else {}),
         calibration__num_samples=args.num_calibration_samples,
         calibration__sequence_length=args.calibration_seqlen,
         calibration__seed=args.calibration_seed,
