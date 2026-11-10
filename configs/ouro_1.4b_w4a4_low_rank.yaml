@@ -19,6 +19,6 @@ method:
     block_size: 128
     statistics_tokens_per_loop: null
   activation: {clip_min: 0.5, clip_max: 1.0, clip_step: 0.01}
-  rotation: {enabled: false}
+  rotation: {enabled: false, block_size: 32, seed: 42}
   channel_scaling: {enabled: false}
 output_dir: outputs/ouro_1.4b_w4a4_low_rank

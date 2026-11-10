@@ -8,13 +8,15 @@ from torch.nn import functional as F
 
 from ..grouping import GroupSize, validate_input_width
 from .quantization import activation_bits, quantize_activation
+from .rotation import block_hadamard_transform, validate_block_hadamard
 
 TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 
 
 class LowRankLinear(nn.Module):
     def __init__(self, linear, *, num_loops, rank_step, sharing, activation_bits,
-                 group_size: GroupSize = 32):
+                 group_size: GroupSize = 32, rotation_enabled=False,
+                 rotation_block_size=32, rotation_seed=42):
         super().__init__()
         self.in_features, self.out_features = linear.in_features, linear.out_features
         if isinstance(rank_step, bool) or not isinstance(rank_step, int) or rank_step < 0:
@@ -30,7 +32,12 @@ class LowRankLinear(nn.Module):
         if isinstance(activation_bits, bool) or not isinstance(activation_bits, int) or activation_bits not in (4, 8):
             raise ValueError("low_rank requires a uniform activation precision of 4 or 8 bits")
         validate_input_width(self.in_features, group_size, name="low-rank input width")
+        if rotation_enabled:
+            validate_block_hadamard(self.in_features, int(rotation_block_size))
         self.activation_bits, self.group_size = activation_bits, group_size
+        self.rotation_enabled = bool(rotation_enabled)
+        self.rotation_block_size = int(rotation_block_size)
+        self.rotation_seed = int(rotation_seed)
         self.loop_id = 0
         self.register_buffer("clip_ratios", torch.ones(num_loops, device=linear.weight.device, dtype=torch.float32))
         banks = num_loops if rank_step else 0
@@ -54,6 +61,8 @@ class LowRankLinear(nn.Module):
         return matrices[0][:rank], matrices[1][:, :rank]
 
     def forward_at_loop(self, value, loop):
+        if self.rotation_enabled:
+            value = block_hadamard_transform(value, self.rotation_block_size, self.rotation_seed)
         value = quantize_activation(value, self.activation_bits, self.group_size, self.clip_ratios[loop])
         if self.rank_step == 0:
             return F.linear(value, self.weight, self.bias)
@@ -102,13 +111,20 @@ def bind_loop_indices(model):
 
 def wrap_linears(model, config):
     bits = activation_bits(config)
+    rotation = config.method.get("rotation", {})
+    rotation_enabled = bool(rotation.get("enabled", False))
+    rotation_block_size = int(rotation.get("block_size", 32))
+    rotation_seed = int(rotation.get("seed", 42))
     for block in model.model.layers:
         for name, module in list(block.named_modules()):
             if isinstance(module, nn.Linear) and name.rsplit(".", 1)[-1] in TARGETS:
                 block.set_submodule(name, LowRankLinear(
                     module, num_loops=config.num_loops, rank_step=config.method["rank_step"],
                     sharing=config.method["sharing"], activation_bits=bits,
-                    group_size=config.quantization["group_size"]))
+                    group_size=config.quantization["group_size"],
+                    rotation_enabled=rotation_enabled,
+                    rotation_block_size=rotation_block_size,
+                    rotation_seed=rotation_seed))
     bind_loop_indices(model)
 
 

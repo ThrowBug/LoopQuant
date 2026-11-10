@@ -46,9 +46,16 @@ def save_checkpoint(model, tokenizer, path, *, quantization_config=None, max_sha
         raise ValueError("low_rank structure does not match checkpoint configuration")
     bits = activation_bits(config)
     allocation = (bits,) * config.num_loops
+    rotation = config.method.get("rotation", {})
+    rotation_enabled = bool(rotation.get("enabled", False))
+    rotation_block_size = int(rotation.get("block_size", 32))
+    rotation_seed = int(rotation.get("seed", 42))
     if (model.config.total_ut_steps != config.num_loops or tuple(model._loopquant_allocation) != allocation
             or any(module.sharing != config.method["sharing"] or module.rank_step != config.method["rank_step"]
                    or module.group_size != config.quantization["group_size"] or module.activation_bits != bits
+                   or module.rotation_enabled != rotation_enabled
+                   or module.rotation_block_size != rotation_block_size
+                   or module.rotation_seed != rotation_seed
                    for module in modules)):
         raise ValueError("low_rank runtime and checkpoint configuration disagree")
     if any(parameter.requires_grad for module in modules for bank in (module.A, module.B) for parameter in bank):
@@ -63,7 +70,15 @@ def save_checkpoint(model, tokenizer, path, *, quantization_config=None, max_sha
         "linears": [{"path": name, "in_features": module.in_features, "out_features": module.out_features,
                      "sharing": module.sharing, "rank_step": module.rank_step, "group_size": module.group_size}
                     for name, module in model.named_modules() if isinstance(module, LowRankLinear)],
-        "has_rotation": False, "attn_implementation": getattr(model.config, "_attn_implementation", None),
+        # low_rank rotations are generated from compact metadata and are not
+        # model-level tensors. Keep has_rotation=False for the generic
+        # checkpoint loader's legacy tensor contract.
+        "has_rotation": False,
+        "has_activation_rotation": rotation_enabled,
+        "rotation": {"enabled": rotation_enabled,
+                      "block_size": rotation_block_size,
+                      "seed": rotation_seed},
+        "attn_implementation": getattr(model.config, "_attn_implementation", None),
         "model_source": getattr(model, "_loopquant_model_path", None), **runtime,
     }
     return _publish_checkpoint(model, tokenizer, target, state, manifest, max_shard_bytes)
@@ -80,6 +95,22 @@ def restore_structure(model, manifest):
     if ranks != manifest["rank_schedule"]:
         raise ValueError("low_rank rank schedule metadata disagrees")
     validate_group_size(config.quantization.get("group_size"), name="checkpoint group_size")
+    rotation = config.method.get("rotation", {})
+    expected_rotation = {
+        "enabled": bool(rotation.get("enabled", False)),
+        "block_size": int(rotation.get("block_size", 32)),
+        "seed": int(rotation.get("seed", 42)),
+    }
+    saved_rotation = manifest.get("rotation", expected_rotation)
+    normalized_saved_rotation = {
+        "enabled": bool(saved_rotation.get("enabled", False)),
+        "block_size": int(saved_rotation.get("block_size", 32)),
+        "seed": int(saved_rotation.get("seed", 42)),
+    }
+    if normalized_saved_rotation != expected_rotation:
+        raise ValueError("low_rank rotation metadata disagrees")
+    if bool(manifest.get("has_activation_rotation", expected_rotation["enabled"])) != expected_rotation["enabled"]:
+        raise ValueError("low_rank activation rotation flag disagrees")
     wrap_linears(model, config)
     actual = {name: module for name, module in model.named_modules() if isinstance(module, LowRankLinear)}
     if set(actual) != {spec["path"] for spec in manifest["linears"]}:

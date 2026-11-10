@@ -69,7 +69,7 @@ LOW_RANK_DEFAULTS = {
                "quantized_damping_target": "update", "low_rank_damping_target": "update",
                "loop_weights": None, "block_size": 128, "statistics_tokens_per_loop": None},
     "activation": {"clip_min": 0.5, "clip_max": 1.0, "clip_step": 0.01},
-    "rotation": {"enabled": False},
+    "rotation": {"enabled": False, "block_size": 32, "seed": 42},
     "channel_scaling": {"enabled": False},
 }
 
@@ -197,8 +197,18 @@ class LoopQuantConfig:
         rank = method["rank_step"]
         if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
             raise ValueError("rank_step must be a nonnegative integer")
-        if any(method[name]["enabled"] for name in ("rotation", "channel_scaling")):
-            raise ValueError("low_rank rotation and channel_scaling are not implemented; keep enabled=false")
+        rotation = method["rotation"]
+        if not isinstance(rotation.get("enabled"), bool):
+            raise ValueError("method.rotation.enabled must be boolean")
+        block_size = rotation.get("block_size", 32)
+        if (isinstance(block_size, bool) or not isinstance(block_size, int) or block_size <= 0
+                or block_size & (block_size - 1)):
+            raise ValueError("method.rotation.block_size must be a positive power of two")
+        seed = rotation.get("seed", 42)
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise ValueError("method.rotation.seed must be an integer")
+        if method["channel_scaling"]["enabled"]:
+            raise ValueError("low_rank channel_scaling is not implemented; keep enabled=false")
         solver = method["solver"]
         if solver["weight_update"] not in {"regression_gptq", "residual_compensation"}:
             raise ValueError("solver.weight_update must be regression_gptq or residual_compensation")

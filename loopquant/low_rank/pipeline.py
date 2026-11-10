@@ -9,6 +9,7 @@ from ..grouping import validate_input_width
 from .cache import prepare_teacher_cache, block_statistics, original_linears
 from .modules import wrap_linears, iter_linears, prepare_inference
 from .quantization import activation_bits
+from .rotation import rotate_weight, validate_block_hadamard
 from .solver import solve_linear
 
 
@@ -21,6 +22,10 @@ class LowRankPipeline:
         config = self.config
         options = config.method["solver"]
         sharing = config.method["sharing"]
+        rotation = config.method.get("rotation", {})
+        rotation_enabled = bool(rotation.get("enabled", False))
+        rotation_block_size = int(rotation.get("block_size", 32))
+        rotation_seed = int(rotation.get("seed", 42))
         active_rank = config.method["rank_step"] * (config.num_loops if sharing == "prefix" else 1)
         model.eval().requires_grad_(False)
         # Validate the complete structure before publishing an expensive cache.
@@ -33,6 +38,8 @@ class LowRankPipeline:
                     config.quantization["group_size"],
                     name="target input width",
                 )
+                if rotation_enabled:
+                    validate_block_hadamard(module.in_features, rotation_block_size)
         teacher = prepare_teacher_cache(model, tokenizer, calibration_data, config, self.device, self.logger)
         fitted, history = [], []
         rank = config.method["rank_step"]
@@ -43,8 +50,11 @@ class LowRankPipeline:
             with torch.no_grad():
                 for name, module in original_linears(block).items():
                     label = f"block={index + 1}/{len(model.model.layers)} module={name}"
+                    original = module.weight
+                    if rotation_enabled:
+                        original = rotate_weight(original, rotation_block_size, rotation_seed)
                     q, a, b, report = solve_linear(
-                        module.weight, statistics.pop(name), rank=rank, options=options, sharing=sharing,
+                        original, statistics.pop(name), rank=rank, options=options, sharing=sharing,
                         bits=config.quantization["weight_bits"], group_size=config.quantization["group_size"],
                         logger=self.logger, label=label)
                     module.weight.copy_(q)
@@ -74,6 +84,9 @@ class LowRankPipeline:
                             (f"alternating_{options['weight_update']}_weighted_svd" if rank
                              else f"quantization_{options['weight_update']}")],
             "sharing": sharing, "rank_step": rank,
+            "rotation": {"enabled": rotation_enabled,
+                          "block_size": rotation_block_size,
+                          "seed": rotation_seed},
             "low_rank_enabled": rank > 0,
             "rank_schedule": [(t + 1) * rank if sharing == "prefix" else rank for t in range(config.num_loops)],
             "low_rank_parameters": sum(parameter.numel() for parameter in parameters),

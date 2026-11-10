@@ -20,6 +20,7 @@ from loopquant.low_rank.cache import prepare_teacher_cache, block_statistics
 from loopquant.low_rank.modules import LowRankLinear, iter_linears, wrap_linears, prepare_inference
 from loopquant.low_rank.pipeline import LowRankPipeline
 from loopquant.low_rank.quantization import quantize_activation
+from loopquant.low_rank.rotation import block_hadamard_transform, rotate_weight
 from loopquant.models import configure_looped_model, load_model_for_evaluation
 from modeling_tiny_ouro import TinyOuroConfig, TinyOuroForCausalLM
 from modeling_paged_ouro import PagedOuroConfig, PagedOuroForCausalLM
@@ -67,7 +68,6 @@ def test_config_uses_configured_loops_and_equal_storage(tmp_path, loops, sharing
 
 @pytest.mark.parametrize("update", [
     {"sharing": "typo"}, {"rank_step": -1}, {"rank_step": False}, {"rank_step": 1.5},
-    {"rotation": {"enabled": True}},
     {"channel_scaling": {"enabled": True}}, {"solver": {"iterations": 0}},
     {"activation_bits": [4, 8]}, {"activation_bits": 6}, {"optimization": {"steps": 0}},
 ])
@@ -108,6 +108,41 @@ def test_missing_damping_targets_default_to_update(tmp_path):
     assert solver["quantized_damping_target"] == "update"
     assert solver["low_rank_damping_target"] == "update"
     assert solver["damp_percent"] == 0.001
+
+
+def test_block_hadamard_rotation_is_norm_preserving_and_configurable(tmp_path):
+    values = torch.randn(3, 64, dtype=torch.float32)
+    rotated = block_hadamard_transform(values, block_size=32, seed=17)
+    torch.testing.assert_close(rotated.square().sum(-1), values.square().sum(-1), rtol=1e-5, atol=1e-5)
+    weight = torch.randn(7, 64, dtype=torch.float32)
+    torch.testing.assert_close(
+        rotate_weight(weight, block_size=32, seed=17).square().sum(-1),
+        weight.square().sum(-1),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    config = configuration(tmp_path)
+    config.method["rotation"] = {"enabled": True, "block_size": 32, "seed": 17}
+    config.validate()
+
+
+def test_low_rank_rotation_pipeline_and_checkpoint_roundtrip(tmp_path):
+    model, tokenizer = tiny(layers=1)
+    config = configuration(tmp_path, loops=2, rank_step=0)
+    config.method["rotation"] = {"enabled": True, "block_size": 32, "seed": 17}
+    result = LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
+    assert result.summary["rotation"] == {"enabled": True, "block_size": 32, "seed": 17}
+    assert all(module.rotation_enabled for block in model.model.layers for _, module in iter_linears(block))
+    expected = model(DATA).logits.detach()
+    snapshot = tmp_path / "rotated"
+    save_quantized_checkpoint(model, tokenizer, snapshot)
+    manifest = json.loads((snapshot / "checkpoint_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["has_activation_rotation"] is True
+    assert manifest["rotation"] == {"enabled": True, "block_size": 32, "seed": 17}
+    restored, _ = load_quantized_checkpoint(snapshot, device="cpu", num_loops=2)
+    assert all(module.rotation_enabled for block in restored.model.layers for _, module in iter_linears(block))
+    with torch.no_grad():
+        torch.testing.assert_close(restored(DATA).logits, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("q_target", ["weight", "update"])

@@ -18,6 +18,7 @@ from ..data import tokenizer_fingerprint
 from .adapter import run_block
 from .modules import TARGETS
 from .quantization import activation_bits, fit_clip, quantize_activation
+from .rotation import block_hadamard_transform, rotate_weight, validate_block_hadamard
 
 CACHE_VERSION = 1
 
@@ -241,14 +242,25 @@ def block_statistics(model, block_index, teacher, config, device):
     """FP64 per-loop Grams and moments of R0=Y-W0 Z, with fixed clips."""
     act = config.method["activation"]
     bits, group = activation_bits(config), config.quantization["group_size"]
+    rotation = config.method.get("rotation", {})
+    rotation_enabled = bool(rotation.get("enabled", False))
+    rotation_block_size = int(rotation.get("block_size", 32))
+    rotation_seed = int(rotation.get("seed", 42))
     # Version 2 keeps activation rounding in the teacher/inference dtype. Old
     # FP-X Hessians and FP32 clipping statistics cannot stand in for these Zs.
     description = {"version": 2, "bits": bits, "group_size": group, "grid": act,
-                   "tokens_per_loop": config.method["solver"]["statistics_tokens_per_loop"]}
+                   "tokens_per_loop": config.method["solver"]["statistics_tokens_per_loop"],
+                   "rotation_implementation": "signed_block_hadamard_v1",
+                   "rotation": {"enabled": rotation_enabled,
+                                "block_size": rotation_block_size,
+                                "seed": rotation_seed}}
     filename = f"block_{block_index:03d}.safetensors"
     cpath = teacher.directory / "activation_clip" / fingerprint(description) / filename
     clips = _load_stat(cpath, description)
     modules = original_linears(model.model.layers[block_index])
+    if rotation_enabled:
+        for module in modules.values():
+            validate_block_hadamard(module.in_features, rotation_block_size)
     if clips is None:
         count = int(round((act["clip_max"] - act["clip_min"]) / act["clip_step"])) + 1
         ratios = [min(act["clip_max"], act["clip_min"] + i * act["clip_step"]) for i in range(count)]
@@ -257,6 +269,8 @@ def block_statistics(model, block_index, teacher, config, device):
         errors = {name: torch.zeros(config.num_loops, len(ratios), device=device) for name in modules}
 
         def collect_clip(name, module, loop, value, target):
+            if rotation_enabled:
+                value = block_hadamard_transform(value, rotation_block_size, rotation_seed)
             errors[name][loop] += fit_clip(value, bits, group, ratios)
 
         _replay_teacher(model, block_index, teacher, config, device, collect_clip)
@@ -269,7 +283,7 @@ def block_statistics(model, block_index, teacher, config, device):
     # their lost accuracy by casting, so residual statistics get a fresh key.
     description = {**description, "version": 3,
                    "clips": {name: value.tolist() for name, value in clips.items()},
-                   "target": "fp_linear_output_without_bias_minus_original_weight_z",
+                   "target": "fp_linear_output_without_bias_minus_teacher_weight_rotated_z",
                    "accumulation_dtype": "float64"}
     path = teacher.directory / "linear_statistics" / fingerprint(description) / filename
     cached = _load_stat(path, description)
@@ -285,9 +299,20 @@ def block_statistics(model, block_index, teacher, config, device):
         "num_tokens": torch.zeros(loops, device=device, dtype=torch.int64),
     } for name, module in modules.items()}
     device_clips = {name: value.to(device) for name, value in clips.items()}
-    references = {name: module.weight.detach().double() for name, module in modules.items()}
+    teacher_weights = teacher.weights(block_index)
+    references = {}
+    for name, module in modules.items():
+        # Always use the immutable FP teacher snapshot. This remains correct if
+        # statistics are collected after another pass has already replaced a
+        # module weight with a quantized/rotated candidate.
+        reference = teacher_weights[name].to(device=module.weight.device, dtype=module.weight.dtype)
+        if rotation_enabled:
+            reference = rotate_weight(reference, rotation_block_size, rotation_seed)
+        references[name] = reference.double()
 
     def collect_statistics(name, module, loop, value, target):
+        if rotation_enabled:
+            value = block_hadamard_transform(value, rotation_block_size, rotation_seed)
         z = quantize_activation(value, bits, group, device_clips[name][loop]).double()
         y = target.double()
         if module.bias is not None:

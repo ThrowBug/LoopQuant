@@ -680,6 +680,10 @@ alternating rounds start from zero low-rank factors. The configuration is:
 method:
   sharing: independent
   rank_step: 16
+  rotation:
+    enabled: false
+    block_size: 32
+    seed: 42
   solver:
     weight_update: regression_gptq
     iterations: 3
@@ -788,12 +792,23 @@ load for inference. Old quantization YAMLs must be migrated to
 the new fields; old checkpoint optimizer metadata is migrated only during loading.
 The former `hessian_mode: mean_activation` ablation is not part of this objective.
 
+When `method.rotation.enabled: true`, the fitter first applies the same signed
+block-Hadamard transform to each target weight's input columns, then performs
+W4 quantization and low-rank fitting in that rotated coordinate system. During
+inference the activation is transformed online immediately before activation
+quantization; the saved base weight and A factors already use the rotated
+coordinates. `block_size` must be a power of two and divide every target input
+width. The rotation metadata is stored in the low-rank checkpoint and restored
+without storing a dense matrix. The rotation-enabled example is
+`configs/ouro_1.4b_w4a4_low_rank_rotation.yaml`.
+
 All calibration tokens are eligible; `statistics_tokens_per_loop: null` uses all
 tokens for clip and linear statistics. A cap takes the same deterministic token
 prefix in each loop and changes the statistics key. Activation precision is uniform
 across all projections and loops: `w4a4` uses A4 and `w4a8` uses A8. Low-rank
 configurations do not accept per-loop bit plans and never run ILPA.
-`rotation.enabled` and `channel_scaling.enabled` are reserved and must remain false.
+`channel_scaling.enabled` remains unsupported. `rotation.enabled` enables the
+signed block-Hadamard path described above.
 
 `calibration.batch_size` controls FP teacher collection; its default is 4.
 Collection batches equal-length

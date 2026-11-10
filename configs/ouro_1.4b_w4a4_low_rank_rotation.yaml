@@ -1,0 +1,24 @@
+algorithm: low_rank
+model_family: ouro
+model_variant: Ouro-1.4B
+model_key: ouro_1.4b
+model_path: models/Ouro-1.4B
+num_loops: 4
+quantization: {weight_bits: 4, group_size: 32, activation_setting: w4a4}
+calibration: {dataset: wikitext2, split: train, num_samples: 128, sequence_length: 2048, seed: 0, batch_size: 4, cache_dir: cache/calibration}
+method:
+  sharing: independent
+  rank_step: 16
+  solver:
+    weight_update: regression_gptq
+    iterations: 3
+    damp_percent: 0.001
+    quantized_damping_target: update
+    low_rank_damping_target: update
+    loop_weights: null
+    block_size: 128
+    statistics_tokens_per_loop: null
+  activation: {clip_min: 0.5, clip_max: 1.0, clip_step: 0.01}
+  rotation: {enabled: true, block_size: 32, seed: 42}
+  channel_scaling: {enabled: false}
+output_dir: outputs/ouro_1.4b_w4a4_low_rank_rotation
