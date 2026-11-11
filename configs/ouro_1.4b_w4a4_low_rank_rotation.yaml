@@ -18,6 +18,7 @@ method:
     loop_weights: null
     block_size: 128
     statistics_tokens_per_loop: null
+    svd_diagnostics: {enabled: false, top_multiplier: 1.2, max_calls_per_linear: 1}
   activation: {clip_min: 0.5, clip_max: 1.0, clip_step: 0.01}
   rotation: {enabled: true, block_size: 32, seed: 42}
   channel_scaling: {enabled: false}

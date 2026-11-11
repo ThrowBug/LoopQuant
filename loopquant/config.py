@@ -67,7 +67,9 @@ LOW_RANK_DEFAULTS = {
     "rank_step": 16,
     "solver": {"weight_update": "regression_gptq", "iterations": 3, "damp_percent": 0.001,
                "quantized_damping_target": "update", "low_rank_damping_target": "update",
-               "loop_weights": None, "block_size": 128, "statistics_tokens_per_loop": None},
+               "loop_weights": None, "block_size": 128, "statistics_tokens_per_loop": None,
+               "svd_diagnostics": {"enabled": False, "top_multiplier": 1.2,
+                                   "max_calls_per_linear": 1}},
     "activation": {"clip_min": 0.5, "clip_max": 1.0, "clip_step": 0.01},
     "rotation": {"enabled": False, "block_size": 32, "seed": 42},
     "channel_scaling": {"enabled": False},
@@ -230,6 +232,18 @@ class LoopQuantConfig:
         cap = solver["statistics_tokens_per_loop"]
         if cap is not None and not _positive_integer(cap):
             raise ValueError("statistics_tokens_per_loop must be positive or null")
+        diagnostics = solver.get("svd_diagnostics", {})
+        if not isinstance(diagnostics, dict):
+            raise ValueError("solver.svd_diagnostics must be a mapping")
+        if not isinstance(diagnostics.get("enabled", False), bool):
+            raise ValueError("solver.svd_diagnostics.enabled must be boolean")
+        multiplier = diagnostics.get("top_multiplier", 1.2)
+        if (isinstance(multiplier, bool) or not isinstance(multiplier, (int, float))
+                or not math.isfinite(multiplier) or multiplier <= 0):
+            raise ValueError("solver.svd_diagnostics.top_multiplier must be positive and finite")
+        max_calls = diagnostics.get("max_calls_per_linear", 1)
+        if (isinstance(max_calls, bool) or not isinstance(max_calls, int) or max_calls < 0):
+            raise ValueError("solver.svd_diagnostics.max_calls_per_linear must be nonnegative")
         act = method["activation"]
         if not 0 < act["clip_min"] <= act["clip_max"] <= 1 or act["clip_step"] <= 0:
             raise ValueError("activation clip grid must lie in (0, 1]")

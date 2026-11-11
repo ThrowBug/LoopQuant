@@ -46,18 +46,27 @@ def continuous_weight(cross, factor):
     return torch.cholesky_solve(cross.T, factor).T
 
 
-def svd_factors(matrix, rank):
+def svd_factors(matrix, rank, *, logger=None, label="", diagnostics=None):
     """Balanced factors of an ordinary rank-k truncated SVD."""
     u, singular, vh = torch.linalg.svd(matrix, full_matrices=False)
+    if diagnostics is not None:
+        call_index = diagnostics["calls"]
+        diagnostics["calls"] += 1
+        max_calls = diagnostics["max_calls_per_linear"]
+        if diagnostics["enabled"] and logger is not None and (max_calls == 0 or call_index < max_calls):
+            top_k = min(singular.numel(), max(1, math.ceil(rank * diagnostics["top_multiplier"])))
+            values = ", ".join(f"{float(value):.6g}" for value in singular[:top_k].detach().cpu())
+            logger.info("[LowRank] %s SVD call=%d rank=%d top%d singular_values=[%s]",
+                        label, call_index + 1, rank, top_k, values)
     root = singular[:rank].clamp_min(0).sqrt()
     b = u[:, :rank] * root[None, :]
     return root[:, None] * vh[:rank], b
 
 
-def low_rank_factors(cross, factor, rank):
+def low_rank_factors(cross, factor, rank, *, logger=None, label="", diagnostics=None):
     """Rank-k weighted solve; cross already includes any ridge reference."""
     whitened = torch.linalg.solve_triangular(factor, cross.T, upper=False).T
-    right, b = svd_factors(whitened, rank)
+    right, b = svd_factors(whitened, rank, logger=logger, label=label, diagnostics=diagnostics)
     a = torch.linalg.solve_triangular(factor.T, right.T, upper=True).T
     return a, b
 
@@ -106,7 +115,7 @@ def _rank_objective(a, b, cross, factor):
 
 
 def _update_prefix(weight, original, a, b, statistics, weights, factors, damping, target,
-                   *, logger=None, label=""):
+                   *, logger=None, label="", diagnostics=None):
     """One forward coordinate pass; outer-iteration damping references stay fixed."""
     hessians, crosses = statistics["hessian"], statistics["residual_cross"]
     delta = weight.double() - original
@@ -127,7 +136,9 @@ def _update_prefix(weight, original, a, b, statistics, weights, factors, damping
             if target == "update":
                 reference_a, reference_b = _loop_factors(a, b, loop, "prefix")
                 cross.addmm_(reference_b, reference_a, alpha=coefficient * rho)
-        current_a, current_b = low_rank_factors(cross, factors[group], rank)
+        current_a, current_b = low_rank_factors(
+            cross, factors[group], rank, logger=logger,
+            label=f"{label} prefix_group={group + 1}", diagnostics=diagnostics)
         current_a, current_b = current_a.to(a[group].dtype), current_b.to(b[group].dtype)
         before = _rank_objective(next_a[group], next_b[group], cross, factors[group])
         after = _rank_objective(current_a, current_b, cross, factors[group])
@@ -184,6 +195,15 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
     low_rank_target = options.get("low_rank_damping_target", "update")
     if q_target not in ("weight", "update") or low_rank_target not in ("weight", "update"):
         raise ValueError("damping targets must be weight or update")
+    diagnostic_options = options.get("svd_diagnostics", {})
+    if not isinstance(diagnostic_options, dict):
+        raise ValueError("solver.svd_diagnostics must be a mapping")
+    svd_diagnostics = {
+        "enabled": bool(diagnostic_options.get("enabled", False)),
+        "top_multiplier": float(diagnostic_options.get("top_multiplier", 1.2)),
+        "max_calls_per_linear": int(diagnostic_options.get("max_calls_per_linear", 1)),
+        "calls": 0,
+    }
     if weight.ndim != 2:
         raise ValueError("solve_linear weight must be a matrix")
     validate_input_width(weight.shape[1], group_size, name=f"{label or 'linear'} weight width")
@@ -226,6 +246,8 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
     if rank == 0:
         baseline_a, baseline_b = [], []
     else:
+        # The baseline SVD is only a comparison candidate. Diagnostics are
+        # reserved for the weighted SVDs used by the actual low-rank updates.
         baseline_a, baseline_b = svd_factors(original - baseline_q.double(), active_rank)
         if sharing == "prefix":
             baseline_a = [value.to(dtype) for value in baseline_a.split(rank, 0)]
@@ -273,7 +295,7 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
         elif sharing == "prefix":
             next_a, next_b, prefix_updates = _update_prefix(
                 candidate, original, a, b, stats, weights, factors, l_damping, low_rank_target,
-                logger=logger, label=label)
+                logger=logger, label=f"{label} iteration={iteration}", diagnostics=svd_diagnostics)
         else:
             next_a, next_b = [], []
             for loop in range(loops):
@@ -282,7 +304,10 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
                     # Constrain the full new L to rank k, not just its increment.
                     previous = b[loop].double() @ a[loop].double()
                     residual_cross = residual_cross + l_damping[loop] * previous
-                current_a, current_b = low_rank_factors(residual_cross, factors[loop], rank)
+                current_a, current_b = low_rank_factors(
+                    residual_cross, factors[loop], rank, logger=logger,
+                    label=f"{label} iteration={iteration} loop={loop + 1}",
+                    diagnostics=svd_diagnostics)
                 next_a.append(current_a.to(dtype))
                 next_b.append(current_b.to(dtype))
         loss, per_loop = reconstruction_loss(

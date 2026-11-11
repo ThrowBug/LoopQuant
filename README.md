@@ -693,7 +693,20 @@ method:
     loop_weights: null
     block_size: 128
     statistics_tokens_per_loop: null
+    svd_diagnostics:
+      enabled: false
+      top_multiplier: 1.2
+      max_calls_per_linear: 1
 ```
+
+Set `svd_diagnostics.enabled: true` to print the leading singular values from the
+weighted SVDs used by the actual low-rank updates. The comparison-only baseline
+SVD is not included. `top_multiplier: 1.2` prints `ceil(1.2 * rank)` values; it
+only controls logging and does not change the fitted rank. By default, at most
+one low-rank SVD call is printed for each target linear layer. Set
+`max_calls_per_linear: 0` to print every low-rank SVD call, but this can produce a
+large log because each loop and each outer iteration performs a separate weighted
+SVD.
 
 `iterations: 1` performs one Q update followed by one complete low-rank pass.
 Three rounds are a starting setting, not a validated Ouro optimum. `loop_weights`
