@@ -165,7 +165,7 @@ def test_prefix_coordinate_keeps_old_factors_when_stored_candidate_is_worse(monk
     import loopquant.low_rank.solver as solver
     original, q, _, _, a, b, weights, stats = problem()
     factors, damping, _ = _prefix_factors(stats["hessian"], weights, 0.001)
-    monkeypatch.setattr(solver, "low_rank_factors", lambda cross, factor, rank:
+    monkeypatch.setattr(solver, "low_rank_factors", lambda cross, factor, rank, **kwargs:
                         (cross.new_full((rank, 8), 1e5), cross.new_full((7, rank), 1e5)))
     next_a, next_b, updates = _update_prefix(q, original, a, b, stats, weights, factors, damping, "update")
     assert all(torch.equal(left, right) for left, right in zip(a + b, next_a + next_b))

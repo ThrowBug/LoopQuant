@@ -72,6 +72,8 @@ def residual_compensation(weight, residual_cross, *, inverse_factor, bits=4,
                 group = work[:, column:column + resolved_group_size].clone()
                 overlap = min(group.shape[1], stop - column)
                 group[:, :overlap] = block[:, local:local + overlap]
+                if overlap < group.shape[1] and local:
+                    group[:, overlap:] -= errors[:, :local] @ inverse[start:column, stop:column + group.shape[1]]
                 scale = _weight_scale(group, qmax)
             current = block[:, local]
             quantized = (current / scale).round().clamp(-qmax, qmax) * scale

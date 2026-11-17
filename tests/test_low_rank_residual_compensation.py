@@ -90,8 +90,8 @@ def test_multiloop_residual_and_damping_are_forwarded_without_unrestricted_regre
         records.append((value.clone(), cross.clone(), q.to(w.dtype)))
         return q
 
-    def fit(*args):
-        a, b = original_low_rank(*args)
+    def fit(*args, **kwargs):
+        a, b = original_low_rank(*args, **kwargs)
         low_rank.append(b.to(w.dtype).double() @ a.to(w.dtype).double())
         return a, b
 

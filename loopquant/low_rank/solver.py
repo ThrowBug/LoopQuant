@@ -64,7 +64,11 @@ def svd_factors(matrix, rank, *, logger=None, label="", diagnostics=None):
 
 
 def low_rank_factors(cross, factor, rank, *, logger=None, label="", diagnostics=None):
-    """Rank-k weighted solve; cross already includes any ridge reference."""
+    """Minimize tr(L H L') - 2<L,C> subject to rank(L)<=rank.
+
+    H=G G', M=C G^{-T}, and L=[M]_rank G^{-1}. The caller incorporates
+    any ridge/reference in H and C; truncating C H^{-1} directly is different.
+    """
     whitened = torch.linalg.solve_triangular(factor, cross.T, upper=False).T
     right, b = svd_factors(whitened, rank, logger=logger, label=label, diagnostics=diagnostics)
     a = torch.linalg.solve_triangular(factor.T, right.T, upper=True).T

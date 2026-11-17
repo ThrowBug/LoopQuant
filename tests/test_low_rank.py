@@ -126,9 +126,14 @@ def test_block_hadamard_rotation_is_norm_preserving_and_configurable(tmp_path):
     config.validate()
 
 
-def test_low_rank_rotation_pipeline_and_checkpoint_roundtrip(tmp_path):
+@pytest.mark.parametrize("rank_step", [0, 2])
+@pytest.mark.parametrize("sharing", ["independent", "prefix"])
+@pytest.mark.parametrize("weight_update", ["regression_gptq", "residual_compensation"])
+@pytest.mark.parametrize("setting", ["w4a4", "w4a8"])
+def test_low_rank_rotation_pipeline_and_checkpoint_roundtrip(tmp_path, rank_step, sharing, weight_update, setting):
     model, tokenizer = tiny(layers=1)
-    config = configuration(tmp_path, loops=2, rank_step=0)
+    config = configuration(tmp_path, loops=2, rank_step=rank_step, sharing=sharing, setting=setting)
+    config.method["solver"]["weight_update"] = weight_update
     config.method["rotation"] = {"enabled": True, "block_size": 32, "seed": 17}
     result = LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
     assert result.summary["rotation"] == {"enabled": True, "block_size": 32, "seed": 17}
@@ -206,13 +211,15 @@ def test_independent_rank_is_not_multiplied_by_loop_count():
         LowRankLinear(linear, num_loops=4, rank_step=16, sharing="prefix", activation_bits=4)
 
 
-def test_linear_statistics_use_quantized_inputs_actual_teacher_and_fixed_clips(tmp_path, monkeypatch):
+@pytest.mark.parametrize("rotation_enabled", [False, True])
+def test_linear_statistics_use_quantized_inputs_actual_teacher_and_fixed_clips(tmp_path, monkeypatch, rotation_enabled):
     import loopquant.low_rank.cache as caching
     model, tokenizer = tiny(layers=1)
     # Include bias subtraction in the regression target contract.
     projection = model.model.layers[0].self_attn.q_proj
     projection.bias = torch.nn.Parameter(torch.linspace(-0.1, 0.1, 32).to(torch.bfloat16))
     config = configuration(tmp_path)
+    config.method["rotation"] = {"enabled": rotation_enabled, "block_size": 32, "seed": 17}
     teacher = prepare_teacher_cache(model, tokenizer, DATA, config, "cpu", logging.getLogger())
     stats, clips = block_statistics(model, 0, teacher, config, "cpu")
     seen = []
@@ -222,10 +229,13 @@ def test_linear_statistics_use_quantized_inputs_actual_teacher_and_fixed_clips(t
         run_block(model, model.model.layers[0], hidden, loop)
     handle.remove()
     current = stats["self_attn.q_proj"]
+    reference = (rotate_weight(projection.weight, 32, 17) if rotation_enabled else projection.weight).double()
     for loop, (x, y) in enumerate(seen):
+        if rotation_enabled:
+            x = block_hadamard_transform(x, 32, 17)
         z = quantize_activation(x, 4, clip=clips["self_attn.q_proj"][loop]).reshape(-1, 32).double()
         y = y.reshape(-1, 32).double() - projection.bias.double()
-        residual = y - z @ projection.weight.double().T
+        residual = y - z @ reference.T
         torch.testing.assert_close(current["hessian"][loop], z.T @ z / 6)
         torch.testing.assert_close(current["residual_cross"][loop], residual.T @ z / 6)
         torch.testing.assert_close(current["residual_energy"][loop], residual.square().sum() / 6)
@@ -461,14 +471,16 @@ def test_pipeline_and_checkpoint_roundtrip_in_a_new_process(tmp_path, setting, b
 @pytest.mark.parametrize("sharing", ["prefix", "independent"])
 @pytest.mark.parametrize("setting,bits", [("w4a4", 4), ("w4a8", 8)])
 @pytest.mark.parametrize("rank_step", [0, 2])
+@pytest.mark.parametrize("rotation_enabled", [False, True])
 def test_low_rank_vllm_prefill_decode_and_method_dispatch(tmp_path, bridge_module, monkeypatch, sharing, setting,
-                                                      bits, rank_step):
+                                                      bits, rank_step, rotation_enabled):
     import loopquant.vllm_backend as backend
     from loopquant.evaluation_config import resolve_evaluation_config
     monkeypatch.delitem(sys.modules, "loopquant.low_rank.vllm_model", raising=False)
     bridge_class = importlib.import_module("loopquant.low_rank.vllm_model").LowRankOuroForCausalLM
     torch.manual_seed(89)
     config = configuration(tmp_path, loops=3, sharing=sharing, setting=setting, rank_step=rank_step)
+    config.method["rotation"] = {"enabled": rotation_enabled, "block_size": 32, "seed": 17}
     model = PagedOuroForCausalLM(PagedOuroConfig(num_hidden_layers=2, total_ut_steps=3)).to(torch.bfloat16).eval()
     configure_looped_model(model, 3, quantization_hooks=False)
     wrap_linears(model, config)

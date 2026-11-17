@@ -63,6 +63,10 @@ def gptq(weight, hessian, *, bits=4, group_size: GroupSize = 32, block_size=128,
                 group = work[:, column:column + resolved_group_size].clone()
                 overlap = min(group.shape[1], stop - column)
                 group[:, :overlap] = block[:, local:local + overlap]
+                if overlap < group.shape[1] and local:
+                    # The tail lives outside this block and has not received
+                    # its pending feedback. Fit one grid to the current group.
+                    group[:, overlap:] -= errors[:, :local] @ inverse[start:column, stop:column + group.shape[1]]
                 base = group.abs().amax(1).clamp_min(1e-8) / qmax
                 candidates = base[:, None] * torch.linspace(1.0, 0.8, 20, device=work.device)[None, :]
                 error = ((group[:, None, :] / candidates[:, :, None]).round().clamp(-qmax, qmax)

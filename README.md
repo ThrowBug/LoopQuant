@@ -657,7 +657,8 @@ decoder-block reconstruction or end-to-end training.
    where D includes the current low-rank subtraction. Residual moments compute
    this without forming large D. With Q fixed, independent fits each loop by
    weighted SVD; prefix makes one forward coordinate pass over its rank-k groups.
-   By default, the low-rank ridge penalizes the whole product rho||L_t||².
+   By default, the low-rank ridge penalizes the change of the complete product,
+   rho||L_t-L_t_previous||²; its first reference is zero.
    The two damping targets can be selected independently below.
 5. Repeat complete Q/low-rank rounds, retaining the full Q/A/B combination with
    the lowest original, unregularized reconstruction error. Also score a baseline
@@ -712,6 +713,34 @@ SVD.
 Three rounds are a starting setting, not a validated Ouro optimum. `loop_weights`
 is null for equal weights or a positive list of length T; weights are normalized.
 `block_size` is the column processing width, not quantization group size.
+Any positive block size is supported, including sizes smaller than a group or
+not divisible by it. When a group crosses a processing-block boundary, its scale
+search includes the pending error feedback on the group's outside columns.
+Blocking therefore preserves the sequential quantization decisions up to
+floating-point rounding; it does not change which channels share a scale.
+
+For fixed clips and teacher outputs, the default Q step uses
+H=sum_t lambda_t Z_t Z_t'/N_t and C=sum_t lambda_t E_t Z_t'/N_t,
+where E_t=Y_t-L_t Z_t. Its continuous optimum is
+W_tilde=(C+rho S)(H+rho I)^-1 with the configured damping reference S.
+Completing the square gives exactly the same regularized quadratic for GPTQ
+around W_tilde; the inverse factor is reused without adding damping again.
+The low-rank step uses G G'=H_t+rho_t I and
+M=(R_t Z_t'/N_t+rho_t S_t)G^-T, then L_t=[M]_k G^-1.
+The rank constraint applies to the complete new L_t in independent mode, and
+to each increment D_j in prefix mode; truncating the continuous L solution
+without whitening solves a different objective.
+
+With input rotation enabled, replace X_t by X_t R before activation clipping
+and quantization, and W0 by W0 R when constructing the reference residual.
+Y_t remains the original FP projection output (without bias): these are local
+input rotations, so the projection output coordinates do not change. Q and all
+low-rank groups are fitted in that rotated input basis. The unrotated teacher
+cache is reusable; rotated clip/statistics caches have distinct identities.
+Pure orthogonal rotation preserves W0's singular values. The weighted SVD
+diagnostics instead describe M, which also depends on activation quantization,
+the current Q, and damping. A smaller leading singular value alone does not
+establish that the compensation or the final model is worse.
 
 Change only `method.sharing` to `prefix` to enable shared-prefix fitting; all
 other configuration fields and launcher arguments remain the same. Each outer

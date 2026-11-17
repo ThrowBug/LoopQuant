@@ -131,10 +131,10 @@ def test_solver_keeps_best_full_pair_and_reuses_factors(monkeypatch, dtype):
         return original_cholesky(*args, **kwargs)
 
     original_low_rank = solver.low_rank_factors
-    def low_rank(cross, factor, rank):
+    def low_rank(cross, factor, rank, **kwargs):
         if len(calls) > 2:
             return cross.new_zeros(rank, cross.shape[1]), cross.new_zeros(cross.shape[0], rank)
-        return original_low_rank(cross, factor, rank)
+        return original_low_rank(cross, factor, rank, **kwargs)
 
     monkeypatch.setattr(solver, "gptq", update)
     monkeypatch.setattr(solver, "regularized_cholesky", factor)
@@ -232,7 +232,7 @@ def test_baseline_does_not_stop_a_path_that_later_improves_and_reference_moves(m
         inputs.append(value.clone())
         return outputs.pop(0)
 
-    def zero_correction(cross, factor, rank):
+    def zero_correction(cross, factor, rank, **kwargs):
         return cross.new_zeros(rank, 32), cross.new_zeros(32, rank)
 
     monkeypatch.setattr(solver, "gptq", quantize)
@@ -274,8 +274,8 @@ def test_all_damping_target_combinations_match_normal_equations(monkeypatch, q_t
         q_inputs.append(value.clone())
         return value
 
-    def record_low_rank(cross, factor, rank):
-        a, b = original_low_rank(cross, factor, rank)
+    def record_low_rank(cross, factor, rank, **kwargs):
+        a, b = original_low_rank(cross, factor, rank, **kwargs)
         low_rank_calls.append((cross.clone(), a, b))
         return a, b
 
