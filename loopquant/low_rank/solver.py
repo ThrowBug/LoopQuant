@@ -163,6 +163,45 @@ def _whitening_plan(statistics, weights, factors, damping, sharing):
     return plan
 
 
+def _update_independent(weight, original, a, b, statistics, factors, damping, target,
+                        *, logger=None, label="", diagnostics=None, whitening=None):
+    """Fit every loop's full rank-k correction with fixed damping references."""
+    _, xz, crosses = _low_rank_statistics(statistics)
+    delta = weight.double() - original
+    cached = whitening is not None and "low_rank_hessian" in statistics
+    next_a, next_b, updates = [], [], []
+    for loop in range(len(a)):
+        cross = None if cached else crosses[loop] - delta @ xz[loop].T
+        white = None
+        if whitening is not None:
+            base, mixed, _ = whitening[loop]
+            white = base - delta @ mixed
+        if target == "update":
+            if not cached:
+                cross = cross + damping[loop] * (b[loop].double() @ a[loop].double())
+            if white is not None:
+                right = torch.linalg.solve_triangular(factors[loop], a[loop].double().T, upper=False).T
+                white.addmm_(b[loop].double(), right, alpha=damping[loop])
+        if cached:
+            cross = white
+        current_a, current_b = low_rank_factors(
+            cross, factors[loop], a[loop].shape[0], logger=logger,
+            label=f"{label} loop={loop + 1}/{len(a)}", diagnostics=diagnostics, whitened=white)
+        current_a, current_b = current_a.to(a[loop].dtype), current_b.to(b[loop].dtype)
+        before = _rank_objective(a[loop], b[loop], cross, factors[loop], whitened=cached)
+        after = _rank_objective(current_a, current_b, cross, factors[loop], whitened=cached)
+        if not math.isfinite(before) or not math.isfinite(after):
+            raise FloatingPointError(f"non-finite independent coordinate objective: {label} loop={loop + 1}")
+        accepted = after <= before
+        next_a.append(current_a if accepted else a[loop])
+        next_b.append(current_b if accepted else b[loop])
+        updates.append({"loop": loop + 1, "accepted": accepted,
+                        "objective_change": after - before if accepted else 0.0})
+        if logger is not None:
+            logger.info("[LowRank] %s loop=%d/%d accepted=%s", label, loop + 1, len(a), accepted)
+    return next_a, next_b, updates
+
+
 def _update_prefix(weight, original, a, b, statistics, weights, factors, damping, target,
                    *, logger=None, label="", diagnostics=None, whitening=None):
     """One forward coordinate pass; outer-iteration damping references stay fixed."""
@@ -262,8 +301,9 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
     """Fit shared Q with independent corrections or cumulative rank-k increments."""
     if sharing not in ("independent", "prefix"):
         raise ValueError("sharing must be independent or prefix")
-    if options.get("initialization", "quantized_first") != "quantized_first":
-        raise ValueError("solver.initialization supports quantized_first only; low_rank_first is not implemented")
+    initialization = options.get("initialization", "quantized_first")
+    if initialization not in ("quantized_first", "low_rank_first"):
+        raise ValueError("solver.initialization must be quantized_first or low_rank_first")
     sweeps = options.get("coordinate_sweeps", 0)
     if isinstance(sweeps, bool) or not isinstance(sweeps, int) or sweeps < 0:
         raise ValueError("solver.coordinate_sweeps must be a nonnegative integer")
@@ -353,10 +393,34 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
                     label, "weight-only" if rank else "GPTQ-only", baseline_loss,
                     weight_update, sharing, q_target, low_rank_target)
 
-    # The first alternating round still starts with L_t=0 and FP W as reference.
+    def update_low_rank(candidate, a, b, stage):
+        if not rank:
+            return [], [], []
+        arguments = dict(logger=logger, label=f"{label} {stage}", diagnostics=svd_diagnostics,
+                         whitening=whitening)
+        if sharing == "prefix":
+            return _update_prefix(candidate, original, a, b, stats, weights, factors,
+                                  l_damping, low_rank_target, **arguments)
+        return _update_independent(candidate, original, a, b, stats, factors,
+                                   l_damping, low_rank_target, **arguments)
+
     banks = loops if rank else 0
     a = [torch.zeros(rank, weight.shape[1], device=device, dtype=dtype) for _ in range(banks)]
     b = [torch.zeros(weight.shape[0], rank, device=device, dtype=dtype) for _ in range(banks)]
+    initialization_report = {"performed": False}
+    if initialization == "low_rank_first" and rank:
+        # Reuse the same mixed-input solve with Q=0: its target is now Y itself.
+        # References in a/b stay zero throughout this single coordinate pass.
+        zero_q = torch.zeros_like(original)
+        a, b, updates = update_low_rank(zero_q, a, b, "phase=initialization")
+        initial_loss, initial_per_loop = reconstruction_loss(
+            zero_q, a, b, stats, weights, reference=original, sharing=sharing)
+        initialization_report = {"performed": True, "loss": initial_loss,
+                                 "per_loop_loss": initial_per_loop, "updates": updates}
+        if logger is not None:
+            logger.info("[LowRank] %s phase=initialization completed loss=%.6g", label, initial_loss)
+    # Q=0 above is temporary; the first Q-update ridge reference remains FP W0.
+    # Only completed Q/L rounds compete against the common baseline candidate.
     reference, history, previous_loss = original, [], None
     for iteration in range(1, options["iterations"] + 1):
         q_reference = reference if q_target == "update" else torch.zeros_like(original)
@@ -395,40 +459,8 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
         # Match the final saved base dtype before computing its low-rank residual.
         candidate = candidate.to(dtype)
         q_loss, _ = reconstruction_loss(candidate, a, b, stats, weights, reference=original, sharing=sharing)
-        if rank == 0:
-            next_a, next_b, prefix_updates = [], [], []
-        elif sharing == "prefix":
-            next_a, next_b, prefix_updates = _update_prefix(
-                candidate, original, a, b, stats, weights, factors, l_damping, low_rank_target,
-                logger=logger, label=f"{label} iteration={iteration}", diagnostics=svd_diagnostics,
-                whitening=whitening)
-        else:
-            next_a, next_b = [], []
-            for loop in range(loops):
-                delta = candidate.double() - original
-                base, mixed, _ = whitening[loop]
-                white = base - delta @ mixed
-                cached = "low_rank_hessian" in stats
-                residual_cross = None if cached else low_crosses[loop] - delta @ input_crosses[loop].T
-                if low_rank_target == "update":
-                    # Constrain the full new L to rank k, not just its increment.
-                    if not cached:
-                        previous = b[loop].double() @ a[loop].double()
-                        residual_cross = residual_cross + l_damping[loop] * previous
-                    white += l_damping[loop] * b[loop].double() @ torch.linalg.solve_triangular(
-                        factors[loop], a[loop].double().T, upper=False).T
-                if cached:
-                    residual_cross = white
-                current_a, current_b = low_rank_factors(
-                    residual_cross, factors[loop], rank, logger=logger,
-                    label=f"{label} iteration={iteration} loop={loop + 1}",
-                    diagnostics=svd_diagnostics, whitened=white)
-                current_a, current_b = current_a.to(dtype), current_b.to(dtype)
-                if _rank_objective(current_a, current_b, residual_cross, factors[loop], whitened=cached) > _rank_objective(
-                        a[loop], b[loop], residual_cross, factors[loop], whitened=cached):
-                    current_a, current_b = a[loop], b[loop]
-                next_a.append(current_a)
-                next_b.append(current_b)
+        next_a, next_b, low_rank_updates = update_low_rank(
+            candidate, a, b, f"phase=alternation iteration={iteration}/{options['iterations']}")
         loss, per_loop = reconstruction_loss(
             candidate, next_a, next_b, stats, weights, reference=original, sharing=sharing)
         if not math.isfinite(loss):
@@ -440,10 +472,9 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
                   "q_unrefined_loss": q_unrefined_loss, "previous_loss": previous_loss,
                   "refined_weights": refined}
         if sharing == "prefix":
-            record["prefix_updates"] = prefix_updates
+            record["prefix_updates"] = low_rank_updates
         if iteration == 1:
-            record["base_loss"], _ = reconstruction_loss(
-                candidate, a, b, stats, weights, reference=original, sharing=sharing)
+            record["base_loss"] = q_loss
         history.append(record)
         if logger is not None:
             logger.info("[LowRank] %s iteration=%d/%d q_loss=%.6g refined_q_loss=%.6g "
@@ -468,7 +499,8 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
               "rank_schedule": [(t + 1) * rank if sharing == "prefix" else rank for t in range(loops)],
               "quantized_damping_target": q_target, "low_rank_damping_target": low_rank_target,
               "q_damping": q_damping, "low_rank_damping": list(l_damping), "iterations": history}
-    report.update(initialization="quantized_first", coordinate_sweeps=sweeps)
+    report.update(initialization=initialization, initialization_report=initialization_report,
+                  coordinate_sweeps=sweeps)
     if sharing == "prefix":
         report["prefix_group_damping"] = suffix_damping
     return q, a, b, report

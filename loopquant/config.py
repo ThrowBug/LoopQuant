@@ -216,8 +216,8 @@ class LoopQuantConfig:
         if method["channel_scaling"]["enabled"]:
             raise ValueError("low_rank channel_scaling is not implemented; keep enabled=false")
         solver = method["solver"]
-        if solver["initialization"] != "quantized_first":
-            raise ValueError("solver.initialization currently supports quantized_first only; low_rank_first is not implemented")
+        if solver["initialization"] not in ("quantized_first", "low_rank_first"):
+            raise ValueError("solver.initialization must be quantized_first or low_rank_first")
         sweeps = solver["coordinate_sweeps"]
         if isinstance(sweeps, bool) or not isinstance(sweeps, int) or sweeps < 0:
             raise ValueError("solver.coordinate_sweeps must be a nonnegative integer")

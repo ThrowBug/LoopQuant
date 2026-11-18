@@ -127,16 +127,22 @@ def test_block_hadamard_rotation_is_norm_preserving_and_configurable(tmp_path):
 
 
 @pytest.mark.parametrize("rank_step", [0, 2])
+@pytest.mark.parametrize("initialization", ["quantized_first", "low_rank_first"])
 @pytest.mark.parametrize("sharing", ["independent", "prefix"])
 @pytest.mark.parametrize("weight_update", ["regression_gptq", "residual_compensation"])
 @pytest.mark.parametrize("setting", ["w4a4", "w4a8"])
-def test_low_rank_rotation_pipeline_and_checkpoint_roundtrip(tmp_path, rank_step, sharing, weight_update, setting):
+def test_low_rank_rotation_pipeline_and_checkpoint_roundtrip(tmp_path, rank_step, sharing, weight_update, setting,
+                                                          initialization):
     model, tokenizer = tiny(layers=1)
     config = configuration(tmp_path, loops=2, rank_step=rank_step, sharing=sharing, setting=setting)
     config.method["solver"]["weight_update"] = weight_update
+    config.method["solver"]["initialization"] = initialization
     config.method["rotation"] = {"enabled": True, "block_size": 32, "seed": 17}
     result = LowRankPipeline(config, device="cpu").run(model, tokenizer, DATA)
     assert result.summary["rotation"] == {"enabled": True, "block_size": 32, "seed": 17}
+    assert result.summary["initialization"] == initialization
+    for record in result.stage_summaries["low_rank_solver"]["linears"]:
+        assert record["initialization_report"]["performed"] == (initialization == "low_rank_first" and rank_step > 0)
     assert all(module.rotation_enabled for block in model.model.layers for _, module in iter_linears(block))
     expected = model(DATA).logits.detach()
     snapshot = tmp_path / "rotated"
@@ -145,6 +151,7 @@ def test_low_rank_rotation_pipeline_and_checkpoint_roundtrip(tmp_path, rank_step
     assert manifest["has_activation_rotation"] is True
     assert manifest["rotation"] == {"enabled": True, "block_size": 32, "seed": 17}
     restored, _ = load_quantized_checkpoint(snapshot, device="cpu", num_loops=2)
+    assert restored._low_rank_config["method"]["solver"]["initialization"] == initialization
     assert all(module.rotation_enabled for block in restored.model.layers for _, module in iter_linears(block))
     with torch.no_grad():
         torch.testing.assert_close(restored(DATA).logits, expected, rtol=0, atol=0)

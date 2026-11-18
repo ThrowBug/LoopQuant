@@ -62,11 +62,13 @@ def test_signed_rotation_inverse_is_not_a_second_forward_rotation():
     assert not torch.allclose(block_hadamard_transform(rotated, 8, 19), x)
 
 
-def test_initialization_is_explicit_and_only_quantized_first_is_implemented(tmp_path):
+def test_initialization_is_explicit_and_validated(tmp_path):
     config = configuration(tmp_path)
     assert config.method["solver"]["initialization"] == "quantized_first"
     config.method["solver"]["initialization"] = "low_rank_first"
-    with pytest.raises(ValueError, match="not implemented"):
+    config.validate()
+    config.method["solver"]["initialization"] = "typo"
+    with pytest.raises(ValueError, match="solver.initialization"):
         config.validate()
 
 

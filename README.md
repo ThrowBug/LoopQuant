@@ -649,7 +649,7 @@ method:
   low_rank_input: full_precision    # quantized reproduces legacy branch inputs
   rotation: {enabled: false, block_size: 32, seed: 42}
   solver:
-    initialization: quantized_first # only implemented initialization
+    initialization: quantized_first # or low_rank_first
     weight_update: regression_gptq  # or residual_compensation
     coordinate_sweeps: 1            # 0 disables fixed-grid Q refinement
     iterations: 3
@@ -667,10 +667,20 @@ method:
 
 `initialization: quantized_first` starts all low-rank factors at zero, updates Q,
 and then fits the independent corrections or makes one forward prefix pass.
-The first Q update counts as iteration 1. `low_rank_first` is reserved for future
-work and currently raises a clear configuration error; it never silently falls
-back. `iterations` must be positive. `loop_weights` is null for equal weights or
-a list of T positive weights, normalized once by the solver.
+The first Q update counts as iteration 1. `initialization: low_rank_first` adds
+one preliminary low-rank pass with Q fixed at zero, fitting Y from the branch
+input X (or Z for `low_rank_input: quantized`). Independent corrections are fit
+separately; prefix increments are fit in one forward coordinate pass, with
+earlier new increments visible to later groups. The zero low-rank damping
+references stay fixed throughout this initialization pass. The first Q update
+still uses W0 as its `update` damping reference, then subsequent rounds use the
+previous accepted Q. Initialization adds one pass of weighted SVDs and does not
+count toward `iterations` or compete as a Q=0 candidate against the baseline.
+With `rank_step: 0`, either initialization choice follows the same quantization
+path. `iterations` must be positive. `loop_weights` is null for equal weights or
+a list of T positive weights, normalized once by the solver. The default remains
+`quantized_first`; switching initialization reuses teacher, clip and linear
+statistics caches and preserves checkpoint/inference structure.
 
 Calibration and reuse:
 
@@ -747,9 +757,15 @@ only a candidate, not initialization. `best_iteration: 0` and
 This fixed-teacher linear objective does not simulate intermediate BF16 GEMM
 rounding or upstream student-state drift, and does not guarantee better PPL.
 
-`svd_diagnostics.enabled: true` logs leading singular values of the current
-whitened M, excluding the comparison-only baseline. `top_multiplier: 1.2` prints
-ceil(1.2*k) values. `max_calls_per_linear: 1` limits logs; 0 prints every call.
+Each independent loop or prefix group logs completion with its initialization
+or alternation phase. `svd_diagnostics.enabled: true` also logs leading singular
+values of the current whitened M, excluding the comparison-only baseline.
+`top_multiplier: 1.2` prints ceil(1.2*k) values. `max_calls_per_linear: 1` limits
+logs across initialization and all iterations together; 0 prints every call.
+Per-linear `low_rank_solver.json` reports include `initialization_report` with
+`performed`, and, when applicable, its Q=0 `loss`, `per_loop_loss` and coordinate
+`updates`. `base_loss` remains the loss after the first Q update and before that
+round's low-rank update, including any initialized low-rank correction.
 These options do not change rank. Small residual singular values do not by
 themselves demonstrate worse model quality.
 

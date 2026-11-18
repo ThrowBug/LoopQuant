@@ -32,13 +32,14 @@ def rank_constrained_regression(inputs, targets, rank):
 
 
 @pytest.mark.parametrize("dual", [False, True])
+@pytest.mark.parametrize("initialization", ["quantized_first", "low_rank_first"])
 @pytest.mark.parametrize("weight_update", ["regression_gptq", "residual_compensation"])
 @pytest.mark.parametrize("sharing", ["independent", "prefix"])
 @pytest.mark.parametrize("bits", [4, 8])
 @pytest.mark.parametrize("q_target", ["weight", "update"])
 @pytest.mark.parametrize("l_target", ["weight", "update"])
 def test_rotated_rounds_match_token_regression_and_rank_constrained_oracles(
-        monkeypatch, sharing, bits, q_target, l_target, dual, weight_update):
+        monkeypatch, sharing, bits, q_target, l_target, dual, weight_update, initialization):
     import loopquant.low_rank.solver as solver
 
     torch.manual_seed(827)
@@ -93,14 +94,51 @@ def test_rotated_rounds_match_token_regression_and_rank_constrained_oracles(
     monkeypatch.setattr(solver, "low_rank_factors", fit)
     monkeypatch.setattr(solver, "residual_compensation", compensate)
     options = {"weight_update": weight_update, "iterations": 3, "damp_percent": 0.04,
+               "initialization": initialization,
                "loop_weights": weights.tolist(), "block_size": 6,
                "quantized_damping_target": q_target, "low_rank_damping_target": l_target}
     final_q, final_a, final_b, report = solve_linear(reference, stats, rank=rank,
                                                   options=options, group_size=4, sharing=sharing,
                                                   rotation={"enabled": True, "block_size": 8, "seed": 19} if dual else None)
-    assert rounds and len(factor_calls) == loops * len(rounds)
+    initial_passes = int(initialization == "low_rank_first")
+    assert rounds and len(factor_calls) == loops * (len(rounds) + initial_passes)
     identity = torch.eye(width, dtype=torch.float64)
     groups = [torch.zeros_like(reference) for _ in range(loops)]
+
+    def check_low_rank_pass(q, old_l, offset):
+        for j in range(loops):
+            inputs, targets = [], []
+            affected = range(j, loops) if sharing == "prefix" else (j,)
+            for t in affected:
+                other = (sum((groups[l] for l in range(t + 1) if l != j), torch.zeros_like(reference))
+                         if sharing == "prefix" else torch.zeros_like(reference))
+                coefficient = weights[t] if sharing == "prefix" else 1.0
+                scale = (coefficient / z[t].shape[1])**0.5
+                inputs.append(scale * inputs_l[t].T)
+                targets.append(scale * (y[t] - q @ z[t] - other @ inputs_l[t]).T)
+                ridge = (coefficient * report["low_rank_damping"][t])**0.5
+                anchor = old_l[t] if l_target == "update" else torch.zeros_like(reference)
+                inputs.append(ridge * identity)
+                targets.append(ridge * (anchor - other).T)
+            expected = rank_constrained_regression(inputs, targets, rank)
+            a, b = factor_calls[offset + j]
+            groups[j] = b @ a
+            torch.testing.assert_close(groups[j], expected, rtol=1e-9, atol=1e-11)
+            assert torch.linalg.matrix_rank(groups[j]) <= rank
+
+    if initial_passes:
+        # Q=0 initialization is checked against explicit augmented-token QR,
+        # with frozen zero anchors throughout the forward prefix pass.
+        check_low_rank_pass(torch.zeros_like(reference), list(groups), 0)
+        initial_l = [sum(groups[:t + 1]) if sharing == "prefix" else groups[t] for t in range(loops)]
+        initial_losses = torch.stack([(initial_l[t] @ inputs_l[t] - y[t]).square().sum()
+                                      / z[t].shape[1] for t in range(loops)])
+        init_report = report["initialization_report"]
+        assert init_report["performed"]
+        assert init_report["loss"] == pytest.approx(float(weights @ initial_losses), rel=1e-10, abs=1e-12)
+        torch.testing.assert_close(torch.tensor(init_report["per_loop_loss"]), initial_losses.float())
+    else:
+        assert not report["initialization_report"]["performed"]
     previous_q = reference
     for iteration, (continuous, q) in enumerate(rounds):
         old_groups = list(groups)
@@ -123,25 +161,7 @@ def test_rotated_rounds_match_token_regression_and_rank_constrained_oracles(
             expected_cross += report["q_damping"] * (q_reference - reference)
             torch.testing.assert_close(continuous, expected_cross, rtol=1e-10, atol=1e-12)
 
-        for j in range(loops):
-            inputs, targets = [], []
-            affected = range(j, loops) if sharing == "prefix" else (j,)
-            for t in affected:
-                other = (sum((groups[l] for l in range(t + 1) if l != j), torch.zeros_like(reference))
-                         if sharing == "prefix" else torch.zeros_like(reference))
-                coefficient = weights[t] if sharing == "prefix" else 1.0
-                scale = (coefficient / z[t].shape[1])**0.5
-                inputs.append(scale * inputs_l[t].T)
-                targets.append(scale * (y[t] - q @ z[t] - other @ inputs_l[t]).T)
-                ridge = (coefficient * report["low_rank_damping"][t])**0.5
-                anchor = old_l[t] if l_target == "update" else torch.zeros_like(reference)
-                inputs.append(ridge * identity)
-                targets.append(ridge * (anchor - other).T)
-            expected = rank_constrained_regression(inputs, targets, rank)
-            a, b = factor_calls[iteration * loops + j]
-            groups[j] = b @ a
-            torch.testing.assert_close(groups[j], expected, rtol=1e-9, atol=1e-11)
-            assert torch.linalg.matrix_rank(groups[j]) <= rank
+        check_low_rank_pass(q, old_l, (iteration + initial_passes) * loops)
         previous_q = q
         per_loop = [sum(groups[:t + 1]) if sharing == "prefix" else groups[t] for t in range(loops)]
         data_loss = sum(weights[t] * (q @ z[t] + per_loop[t] @ inputs_l[t] - y[t]).square().sum()
