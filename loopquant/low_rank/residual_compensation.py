@@ -1,7 +1,7 @@
 """Fixed-target residual compensation using cached output moments.
 
 The constrained residual update is inspired by GPTAQ and supports arbitrary
-targets E, including E_t=Y_t-L_t Z_t. It does not use the paper's input-neuron residual
+targets E, including E_t=Y_t-L_t X_t. It does not use the paper's input-neuron residual
 decomposition, which cannot be recovered from output cross moments alone.
 """
 
@@ -21,7 +21,7 @@ def _weight_scale(group, qmax):
 
 @torch.no_grad()
 def residual_compensation(weight, residual_cross, *, inverse_factor, bits=4,
-                          group_size: GroupSize = 32, block_size=128):
+                          group_size: GroupSize = 32, block_size=128, return_scales=False):
     """Quantize W0 directly, then compensate remaining weights for a fixed E.
 
     For J(V)=sum_t lambda_t ||V Z_t-E_t||^2/N_t + rho||V-S||^2,
@@ -62,6 +62,7 @@ def residual_compensation(weight, residual_cross, *, inverse_factor, bits=4,
     qmax = 2 ** (bits - 1) - 1
     resolved_group_size = effective_group_size(group_size, width)
     scale = None
+    scales = []
     for start in range(0, width, block_size):
         stop = min(start + block_size, width)
         block = work[:, start:stop].clone()
@@ -75,6 +76,8 @@ def residual_compensation(weight, residual_cross, *, inverse_factor, bits=4,
                 if overlap < group.shape[1] and local:
                     group[:, overlap:] -= errors[:, :local] @ inverse[start:column, stop:column + group.shape[1]]
                 scale = _weight_scale(group, qmax)
+                if return_scales:
+                    scales.append(scale.clone())
             current = block[:, local]
             quantized = (current / scale).round().clamp(-qmax, qmax) * scale
             result[:, column] = quantized
@@ -86,4 +89,5 @@ def residual_compensation(weight, residual_cross, *, inverse_factor, bits=4,
                 work[:, stop:] += correction[:, stop - 1:]
                 correction = None
         work[:, stop:] -= errors @ inverse[start:stop, stop:]
-    return result.to(weight.dtype)
+    result = result.to(weight.dtype)
+    return (result, torch.stack(scales, dim=1)) if return_scales else result

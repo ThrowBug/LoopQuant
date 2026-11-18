@@ -16,7 +16,7 @@ TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down
 class LowRankLinear(nn.Module):
     def __init__(self, linear, *, num_loops, rank_step, sharing, activation_bits,
                  group_size: GroupSize = 32, rotation_enabled=False,
-                 rotation_block_size=32, rotation_seed=42):
+                 rotation_block_size=32, rotation_seed=42, low_rank_input="full_precision"):
         super().__init__()
         self.in_features, self.out_features = linear.in_features, linear.out_features
         if isinstance(rank_step, bool) or not isinstance(rank_step, int) or rank_step < 0:
@@ -38,6 +38,9 @@ class LowRankLinear(nn.Module):
         self.rotation_enabled = bool(rotation_enabled)
         self.rotation_block_size = int(rotation_block_size)
         self.rotation_seed = int(rotation_seed)
+        if low_rank_input not in ("full_precision", "quantized"):
+            raise ValueError("invalid low_rank_input")
+        self.low_rank_input = low_rank_input
         self.loop_id = 0
         self.register_buffer("clip_ratios", torch.ones(num_loops, device=linear.weight.device, dtype=torch.float32))
         banks = num_loops if rank_step else 0
@@ -61,13 +64,15 @@ class LowRankLinear(nn.Module):
         return matrices[0][:rank], matrices[1][:, :rank]
 
     def forward_at_loop(self, value, loop):
+        original = value
         if self.rotation_enabled:
             value = block_hadamard_transform(value, self.rotation_block_size, self.rotation_seed)
         value = quantize_activation(value, self.activation_bits, self.group_size, self.clip_ratios[loop])
         if self.rank_step == 0:
             return F.linear(value, self.weight, self.bias)
         a, b = self.factors(loop)
-        correction = F.linear(F.linear(value, a.contiguous()), b.contiguous())
+        low_rank_value = original if self.low_rank_input == "full_precision" else value
+        correction = F.linear(F.linear(low_rank_value, a.contiguous()), b.contiguous())
         return F.linear(value, self.weight, self.bias) + correction
 
     def forward(self, value):
@@ -124,7 +129,7 @@ def wrap_linears(model, config):
                     group_size=config.quantization["group_size"],
                     rotation_enabled=rotation_enabled,
                     rotation_block_size=rotation_block_size,
-                    rotation_seed=rotation_seed))
+                    rotation_seed=rotation_seed, low_rank_input=config.method["low_rank_input"]))
     bind_loop_indices(model)
 
 

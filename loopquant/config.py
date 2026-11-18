@@ -65,7 +65,9 @@ DEFAULTS: dict[str, Any] = {
 LOW_RANK_DEFAULTS = {
     "sharing": "independent",
     "rank_step": 16,
+    "low_rank_input": "full_precision",
     "solver": {"weight_update": "regression_gptq", "iterations": 3, "damp_percent": 0.001,
+               "initialization": "quantized_first", "coordinate_sweeps": 1,
                "quantized_damping_target": "update", "low_rank_damping_target": "update",
                "loop_weights": None, "block_size": 128, "statistics_tokens_per_loop": None,
                "svd_diagnostics": {"enabled": False, "top_multiplier": 1.2,
@@ -196,6 +198,8 @@ class LoopQuantConfig:
             raise ValueError("low_rank currently implements Ouro only")
         if method["sharing"] not in {"prefix", "independent"}:
             raise ValueError("sharing must be prefix or independent")
+        if method["low_rank_input"] not in {"full_precision", "quantized"}:
+            raise ValueError("method.low_rank_input must be full_precision or quantized")
         rank = method["rank_step"]
         if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
             raise ValueError("rank_step must be a nonnegative integer")
@@ -212,6 +216,11 @@ class LoopQuantConfig:
         if method["channel_scaling"]["enabled"]:
             raise ValueError("low_rank channel_scaling is not implemented; keep enabled=false")
         solver = method["solver"]
+        if solver["initialization"] != "quantized_first":
+            raise ValueError("solver.initialization currently supports quantized_first only; low_rank_first is not implemented")
+        sweeps = solver["coordinate_sweeps"]
+        if isinstance(sweeps, bool) or not isinstance(sweeps, int) or sweeps < 0:
+            raise ValueError("solver.coordinate_sweeps must be a nonnegative integer")
         if solver["weight_update"] not in {"regression_gptq", "residual_compensation"}:
             raise ValueError("solver.weight_update must be regression_gptq or residual_compensation")
         if not _positive_integer(solver["iterations"]):

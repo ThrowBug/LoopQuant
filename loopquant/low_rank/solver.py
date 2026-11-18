@@ -7,6 +7,8 @@ import torch
 from ..grouping import GroupSize, validate_input_width
 from .quantization import gptq
 from .residual_compensation import residual_compensation
+from .refinement import refine_quantized
+from .rotation import inverse_block_hadamard_transform
 
 
 def regularized_cholesky(hessian, damp_percent, *, logger=None, label=""):
@@ -63,13 +65,14 @@ def svd_factors(matrix, rank, *, logger=None, label="", diagnostics=None):
     return root[:, None] * vh[:rank], b
 
 
-def low_rank_factors(cross, factor, rank, *, logger=None, label="", diagnostics=None):
+def low_rank_factors(cross, factor, rank, *, logger=None, label="", diagnostics=None, whitened=None):
     """Minimize tr(L H L') - 2<L,C> subject to rank(L)<=rank.
 
     H=G G', M=C G^{-T}, and L=[M]_rank G^{-1}. The caller incorporates
     any ridge/reference in H and C; truncating C H^{-1} directly is different.
     """
-    whitened = torch.linalg.solve_triangular(factor, cross.T, upper=False).T
+    if whitened is None:
+        whitened = torch.linalg.solve_triangular(factor, cross.T, upper=False).T
     right, b = svd_factors(whitened, rank, logger=logger, label=label, diagnostics=diagnostics)
     a = torch.linalg.solve_triangular(factor.T, right.T, upper=True).T
     return a, b
@@ -110,42 +113,101 @@ def _prefix_factors(hessians, weights, damp_percent, *, logger=None, label=""):
     return factors, damping, suffix_damping
 
 
-def _rank_objective(a, b, cross, factor):
+def _rank_objective(a, b, cross, factor, *, whitened=False):
     """Variable part of the coordinate objective, evaluated at stored precision."""
     a, b = a.double(), b.double()
-    whitened = a @ factor
-    quadratic = ((b.T @ b) * (whitened @ whitened.T)).sum()
-    return float(quadratic - 2 * ((b.T @ cross) * a).sum())
+    transformed = a @ factor
+    quadratic = ((b.T @ b) * (transformed @ transformed.T)).sum()
+    right = transformed if whitened else a
+    return float(quadratic - 2 * ((b.T @ cross) * right).sum())
+
+
+def _low_rank_statistics(statistics):
+    """Missing mixed fields denote legacy single-input solver callers."""
+    fields = ("low_rank_hessian", "input_cross", "low_rank_cross")
+    present = [name in statistics for name in fields]
+    if any(present) and not all(present):
+        raise ValueError("incomplete dual-input statistics")
+    if all(present):
+        return tuple(statistics[name] for name in fields)
+    return statistics["hessian"], statistics["hessian"], statistics["residual_cross"]
+
+
+def _whitening_plan(statistics, weights, factors, damping, sharing):
+    """Cache fixed whitened targets and couplings once per physical linear."""
+    h, xz, cross = _low_rank_statistics(statistics)
+    plan = []
+    suffix_h, suffix_ridge = [], []
+    if sharing == "prefix":
+        for i in range(len(h)):
+            suffix_h.append(sum(float(weights[t]) * h[t] for t in range(i, len(h))))
+            suffix_ridge.append(sum(float(weights[t]) * damping[t] for t in range(i, len(h))))
+    for i, g in enumerate(factors):
+        whiten = lambda matrix: torch.linalg.solve_triangular(g, matrix.T, upper=False).T
+        if sharing == "independent":
+            plan.append((whiten(cross[i]), whiten(xz[i].T), None))
+        else:
+            base = sum(float(weights[t]) * cross[t] for t in range(i, len(h)))
+            mixed = sum(float(weights[t]) * xz[t].T for t in range(i, len(h)))
+            kernels = {}
+            for j in range(len(h)):
+                if j == i:
+                    continue
+                if j < i:
+                    kernels[j] = g  # (H_i + ridge_i I) G_i^-T = G_i
+                else:
+                    matrix = suffix_h[j].clone()
+                    matrix.diagonal().add_(suffix_ridge[j])
+                    kernels[j] = whiten(matrix)
+            plan.append((whiten(base), whiten(mixed), kernels))
+    return plan
 
 
 def _update_prefix(weight, original, a, b, statistics, weights, factors, damping, target,
-                   *, logger=None, label="", diagnostics=None):
+                   *, logger=None, label="", diagnostics=None, whitening=None):
     """One forward coordinate pass; outer-iteration damping references stay fixed."""
-    hessians, crosses = statistics["hessian"], statistics["residual_cross"]
+    hessians, xz, crosses = _low_rank_statistics(statistics)
     delta = weight.double() - original
-    base_crosses = [crosses[t] - delta @ hessians[t] for t in range(len(a))]
+    cached = whitening is not None and "low_rank_hessian" in statistics
+    base_crosses = None if cached else [crosses[t] - delta @ xz[t].T for t in range(len(a))]
     next_a, next_b, updates = list(a), list(b), []
     rank = a[0].shape[0]
     for group in range(len(a)):
-        cross = torch.zeros_like(base_crosses[0])
-        for loop in range(group, len(a)):
-            coefficient, rho = float(weights[loop]), damping[loop]
-            cross.add_(base_crosses[loop], alpha=coefficient)
-            for other in range(loop + 1):
-                if other != group:
-                    # Includes new earlier groups and old later groups.
-                    right = next_a[other].double()
-                    cross.addmm_(next_b[other].double(), right @ hessians[loop] + rho * right,
-                                 alpha=-coefficient)
+        cross = None
+        if not cached:
+            cross = torch.zeros_like(base_crosses[0])
+            for loop in range(group, len(a)):
+                coefficient, rho = float(weights[loop]), damping[loop]
+                cross.add_(base_crosses[loop], alpha=coefficient)
+                for other in range(loop + 1):
+                    if other != group:
+                        right = next_a[other].double()
+                        cross.addmm_(next_b[other].double(), right @ hessians[loop] + rho * right,
+                                     alpha=-coefficient)
+                if target == "update":
+                    reference_a, reference_b = _loop_factors(a, b, loop, "prefix")
+                    cross.addmm_(reference_b, reference_a, alpha=coefficient * rho)
+        whitened = None
+        if whitening is not None:
+            base, mixed, kernels = whitening[group]
+            whitened = base - delta @ mixed
+            for other, kernel in kernels.items():
+                whitened -= next_b[other].double() @ (next_a[other].double() @ kernel)
             if target == "update":
-                reference_a, reference_b = _loop_factors(a, b, loop, "prefix")
-                cross.addmm_(reference_b, reference_a, alpha=coefficient * rho)
+                for other in range(len(a)):
+                    coefficient = sum(float(weights[t]) * damping[t]
+                                      for t in range(max(group, other), len(a)))
+                    right = torch.linalg.solve_triangular(
+                        factors[group], a[other].double().T, upper=False).T
+                    whitened.addmm_(b[other].double(), right, alpha=coefficient)
+        if cached:
+            cross = whitened
         current_a, current_b = low_rank_factors(
             cross, factors[group], rank, logger=logger,
-            label=f"{label} prefix_group={group + 1}", diagnostics=diagnostics)
+            label=f"{label} prefix_group={group + 1}", diagnostics=diagnostics, whitened=whitened)
         current_a, current_b = current_a.to(a[group].dtype), current_b.to(b[group].dtype)
-        before = _rank_objective(next_a[group], next_b[group], cross, factors[group])
-        after = _rank_objective(current_a, current_b, cross, factors[group])
+        before = _rank_objective(next_a[group], next_b[group], cross, factors[group], whitened=cached)
+        after = _rank_objective(current_a, current_b, cross, factors[group], whitened=cached)
         if not math.isfinite(before) or not math.isfinite(after):
             raise FloatingPointError(f"non-finite prefix coordinate objective: {label} group={group + 1}")
         # Casting factors to BF16 can undo a small mathematical improvement.
@@ -166,17 +228,25 @@ def reconstruction_loss(weight, a, b, statistics, loop_weights, *, reference, sh
     from intermediate BF16 GEMM rounding and upstream student-state drift.
     """
     losses = []
+    hx, xz, kx = _low_rank_statistics(statistics)
     for loop in range(len(statistics["hessian"])):
         delta = weight.double() - reference.double()
-        if a:
-            loop_a, loop_b = _loop_factors(a, b, loop, sharing)
-            delta = delta + loop_b @ loop_a
         quadratic = ((delta @ statistics["hessian"][loop]) * delta).sum()
         cross = (delta * statistics["residual_cross"][loop]).sum()
+        magnitude = quadratic.abs() + 2 * cross.abs()
+        if a:
+            loop_a, loop_b = _loop_factors(a, b, loop, sharing)
+            low_rank = loop_b @ loop_a
+            low_quadratic = ((low_rank @ hx[loop]) * low_rank).sum()
+            interaction = ((low_rank @ xz[loop]) * delta).sum()
+            low_cross = (low_rank * kx[loop]).sum()
+            quadratic = quadratic + low_quadratic + 2 * interaction
+            cross = cross + low_cross
+            magnitude += low_quadratic.abs() + 2 * interaction.abs() + 2 * low_cross.abs()
         energy = statistics["residual_energy"][loop]
         error = quadratic - 2 * cross + energy
         tolerance = 128 * delta.shape[1] * torch.finfo(torch.float64).eps * (
-            quadratic.abs() + 2 * cross.abs() + energy.abs())
+            magnitude + energy.abs())
         if error < -tolerance:
             raise FloatingPointError("negative reconstruction loss: inconsistent residual statistics")
         losses.append(error.clamp_min(0))
@@ -188,10 +258,15 @@ def reconstruction_loss(weight, a, b, statistics, loop_weights, *, reference, sh
 
 @torch.no_grad()
 def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: GroupSize = 32,
-                 sharing="independent", logger=None, label=""):
+                 sharing="independent", logger=None, label="", rotation=None):
     """Fit shared Q with independent corrections or cumulative rank-k increments."""
     if sharing not in ("independent", "prefix"):
         raise ValueError("sharing must be independent or prefix")
+    if options.get("initialization", "quantized_first") != "quantized_first":
+        raise ValueError("solver.initialization supports quantized_first only; low_rank_first is not implemented")
+    sweeps = options.get("coordinate_sweeps", 0)
+    if isinstance(sweeps, bool) or not isinstance(sweeps, int) or sweeps < 0:
+        raise ValueError("solver.coordinate_sweeps must be a nonnegative integer")
     weight_update = options["weight_update"]
     if weight_update not in ("regression_gptq", "residual_compensation"):
         raise ValueError("solver.weight_update must be regression_gptq or residual_compensation")
@@ -214,6 +289,9 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
     device, dtype = weight.device, weight.dtype
     stats = {name: value.to(device=device, dtype=torch.float64) for name, value in statistics.items()}
     hessians, crosses = stats["hessian"], stats["residual_cross"]
+    low_hessians, input_crosses, low_crosses = _low_rank_statistics(stats)
+    if not all(torch.isfinite(value).all() for value in (low_hessians, input_crosses, low_crosses)):
+        raise ValueError("non-finite dual-input calibration statistics")
     if not all(torch.isfinite(stats[key]).all() for key in ("residual_cross", "residual_energy")):
         raise ValueError(f"non-finite calibration residual statistics: {label}")
     original = weight.detach().double()
@@ -229,6 +307,8 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
     shared_cross = (crosses * weights[:, None, None]).sum(0)
     shared_factor, q_damping = regularized_cholesky(
         shared_hessian, options["damp_percent"], logger=logger, label=f"{label} shared Q")
+    regularized_hessian = shared_hessian.clone()
+    regularized_hessian.diagonal().add_(q_damping)
     inverse_factor64 = torch.linalg.cholesky(torch.cholesky_inverse(shared_factor), upper=True)
     inverse_factor = inverse_factor64.float()
     if weight_update != "residual_compensation":
@@ -237,11 +317,12 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
         factors, l_damping, suffix_damping = [], [], []
     elif sharing == "prefix":
         factors, l_damping, suffix_damping = _prefix_factors(
-            hessians, weights, options["damp_percent"], logger=logger, label=label)
+            low_hessians, weights, options["damp_percent"], logger=logger, label=label)
     else:
         factors, l_damping = zip(*(regularized_cholesky(
             h, options["damp_percent"], logger=logger, label=f"{label} loop={loop + 1}")
-            for loop, h in enumerate(hessians)))
+            for loop, h in enumerate(low_hessians)))
+    whitening = _whitening_plan(stats, weights, factors, l_damping, sharing) if rank else []
 
     # GPTQ (plus weight-error SVD when enabled) participates in selection too. It uses
     # the same Z Gram and clip as the alternating candidates (not the old X Gram).
@@ -252,7 +333,11 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
     else:
         # The baseline SVD is only a comparison candidate. Diagnostics are
         # reserved for the weighted SVDs used by the actual low-rank updates.
-        baseline_a, baseline_b = svd_factors(original - baseline_q.double(), active_rank)
+        baseline_residual = original - baseline_q.double()
+        if rotation and rotation.get("enabled", False):
+            baseline_residual = inverse_block_hadamard_transform(
+                baseline_residual, rotation["block_size"], rotation.get("seed", 42))
+        baseline_a, baseline_b = svd_factors(baseline_residual, active_rank)
         if sharing == "prefix":
             baseline_a = [value.to(dtype) for value in baseline_a.split(rank, 0)]
             baseline_b = [value.to(dtype) for value in baseline_b.split(rank, 1)]
@@ -284,36 +369,66 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
         if rank:
             for loop in range(loops):
                 loop_a, loop_b = _loop_factors(a, b, loop, sharing)
-                adjusted.addmm_(loop_b, loop_a @ hessians[loop], alpha=-float(weights[loop]))
+                adjusted.addmm_(loop_b, loop_a @ input_crosses[loop], alpha=-float(weights[loop]))
         if weight_update == "regression_gptq":
             continuous = q_reference + continuous_weight(adjusted, shared_factor)
             candidate = gptq(continuous, shared_hessian, bits=bits, group_size=group_size,
-                             block_size=options["block_size"], inverse_factor=inverse_factor)
+                             block_size=options["block_size"], inverse_factor=inverse_factor,
+                             **({"return_scales": True} if sweeps else {}))
         else:
             candidate = residual_compensation(original, adjusted, bits=bits, group_size=group_size,
-                                               block_size=options["block_size"], inverse_factor=inverse_factor64)
+                                               block_size=options["block_size"], inverse_factor=inverse_factor64,
+                                               **({"return_scales": True} if sweeps else {}))
+        refined = 0
+        unrefined = candidate[0] if sweeps else candidate
+        q_unrefined_loss, _ = reconstruction_loss(
+            unrefined.to(dtype), a, b, stats, weights, reference=original, sharing=sharing)
+        if sweeps:
+            candidate, scales = candidate
+            if weight_update == "regression_gptq":
+                residual_gradient = adjusted + (q_reference - original) @ regularized_hessian
+            else:
+                residual_gradient = adjusted
+            candidate, refined = refine_quantized(
+                candidate.to(dtype), scales, regularized_hessian,
+                residual_gradient, reference=original, bits=bits, group_size=group_size, sweeps=sweeps)
         # Match the final saved base dtype before computing its low-rank residual.
         candidate = candidate.to(dtype)
+        q_loss, _ = reconstruction_loss(candidate, a, b, stats, weights, reference=original, sharing=sharing)
         if rank == 0:
             next_a, next_b, prefix_updates = [], [], []
         elif sharing == "prefix":
             next_a, next_b, prefix_updates = _update_prefix(
                 candidate, original, a, b, stats, weights, factors, l_damping, low_rank_target,
-                logger=logger, label=f"{label} iteration={iteration}", diagnostics=svd_diagnostics)
+                logger=logger, label=f"{label} iteration={iteration}", diagnostics=svd_diagnostics,
+                whitening=whitening)
         else:
             next_a, next_b = [], []
             for loop in range(loops):
-                residual_cross = crosses[loop] - (candidate.double() - original) @ hessians[loop]
+                delta = candidate.double() - original
+                base, mixed, _ = whitening[loop]
+                white = base - delta @ mixed
+                cached = "low_rank_hessian" in stats
+                residual_cross = None if cached else low_crosses[loop] - delta @ input_crosses[loop].T
                 if low_rank_target == "update":
                     # Constrain the full new L to rank k, not just its increment.
-                    previous = b[loop].double() @ a[loop].double()
-                    residual_cross = residual_cross + l_damping[loop] * previous
+                    if not cached:
+                        previous = b[loop].double() @ a[loop].double()
+                        residual_cross = residual_cross + l_damping[loop] * previous
+                    white += l_damping[loop] * b[loop].double() @ torch.linalg.solve_triangular(
+                        factors[loop], a[loop].double().T, upper=False).T
+                if cached:
+                    residual_cross = white
                 current_a, current_b = low_rank_factors(
                     residual_cross, factors[loop], rank, logger=logger,
                     label=f"{label} iteration={iteration} loop={loop + 1}",
-                    diagnostics=svd_diagnostics)
-                next_a.append(current_a.to(dtype))
-                next_b.append(current_b.to(dtype))
+                    diagnostics=svd_diagnostics, whitened=white)
+                current_a, current_b = current_a.to(dtype), current_b.to(dtype)
+                if _rank_objective(current_a, current_b, residual_cross, factors[loop], whitened=cached) > _rank_objective(
+                        a[loop], b[loop], residual_cross, factors[loop], whitened=cached):
+                    current_a, current_b = a[loop], b[loop]
+                next_a.append(current_a)
+                next_b.append(current_b)
         loss, per_loop = reconstruction_loss(
             candidate, next_a, next_b, stats, weights, reference=original, sharing=sharing)
         if not math.isfinite(loss):
@@ -321,7 +436,9 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
         accepted = previous_loss is None or loss < previous_loss
         selected = loss < best[3]
         record = {"iteration": iteration, "loss": loss, "per_loop_loss": per_loop,
-                  "accepted": accepted, "selected": selected}
+                  "accepted": accepted, "selected": selected, "q_loss": q_loss,
+                  "q_unrefined_loss": q_unrefined_loss, "previous_loss": previous_loss,
+                  "refined_weights": refined}
         if sharing == "prefix":
             record["prefix_updates"] = prefix_updates
         if iteration == 1:
@@ -329,8 +446,9 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
                 candidate, a, b, stats, weights, reference=original, sharing=sharing)
         history.append(record)
         if logger is not None:
-            logger.info("[LowRank] %s iteration=%d/%d loss=%.6g accepted=%s selected=%s", label,
-                        iteration, options["iterations"], loss, accepted, selected)
+            logger.info("[LowRank] %s iteration=%d/%d q_loss=%.6g refined_q_loss=%.6g "
+                        "loss=%.6g accepted=%s selected=%s", label,
+                        iteration, options["iterations"], q_unrefined_loss, q_loss, loss, accepted, selected)
         if selected:
             best = candidate, next_a, next_b, loss, iteration
         if not accepted or loss == 0:
@@ -350,6 +468,7 @@ def solve_linear(weight, statistics, *, rank, options, bits=4, group_size: Group
               "rank_schedule": [(t + 1) * rank if sharing == "prefix" else rank for t in range(loops)],
               "quantized_damping_target": q_target, "low_rank_damping_target": low_rank_target,
               "q_damping": q_damping, "low_rank_damping": list(l_damping), "iterations": history}
+    report.update(initialization="quantized_first", coordinate_sweeps=sweeps)
     if sharing == "prefix":
         report["prefix_group_damping"] = suffix_damping
     return q, a, b, report

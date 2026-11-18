@@ -31,12 +31,14 @@ def rank_constrained_regression(inputs, targets, rank):
     return torch.linalg.solve_triangular(triangular, truncated, upper=True).T
 
 
+@pytest.mark.parametrize("dual", [False, True])
+@pytest.mark.parametrize("weight_update", ["regression_gptq", "residual_compensation"])
 @pytest.mark.parametrize("sharing", ["independent", "prefix"])
 @pytest.mark.parametrize("bits", [4, 8])
 @pytest.mark.parametrize("q_target", ["weight", "update"])
 @pytest.mark.parametrize("l_target", ["weight", "update"])
 def test_rotated_rounds_match_token_regression_and_rank_constrained_oracles(
-        monkeypatch, sharing, bits, q_target, l_target):
+        monkeypatch, sharing, bits, q_target, l_target, dual, weight_update):
     import loopquant.low_rank.solver as solver
 
     torch.manual_seed(827)
@@ -48,8 +50,7 @@ def test_rotated_rounds_match_token_regression_and_rank_constrained_oracles(
     for value in x:
         value[0] *= 7
     y = [original @ value for value in x]
-    # Inputs and weights enter the same rotated basis; teacher outputs stay
-    # in their original output coordinates. BA and Q both consume this Z.
+    # Q consumes rotated/quantized Z; dual-input BA consumes original X.
     z = [quantize_activation(block_hadamard_transform(value.T, 8, 19), bits,
                              group_size=4, clip=0.9).T for value in x]
     residual = [target - reference @ value for target, value in zip(y, z)]
@@ -58,17 +59,29 @@ def test_rotated_rounds_match_token_regression_and_rank_constrained_oracles(
         "residual_cross": torch.stack([r @ value.T / value.shape[1] for r, value in zip(residual, z)]),
         "residual_energy": torch.stack([r.square().sum() / r.shape[1] for r in residual]),
     }
+    inputs_l = x if dual else z
+    if dual:
+        stats.update(
+            low_rank_hessian=torch.stack([v @ v.T / v.shape[1] for v in x]),
+            input_cross=torch.stack([v @ zz.T / v.shape[1] for v, zz in zip(x, z)]),
+            low_rank_cross=torch.stack([r @ v.T / v.shape[1] for r, v in zip(residual, x)]))
     weights = torch.tensor([0.2, 0.3, 0.5], dtype=torch.float64)
     rounds, factor_calls = [], []
     original_gptq, original_low_rank = solver.gptq, solver.low_rank_factors
+    original_compensate = solver.residual_compensation
     calls = 0
 
     def quantize(continuous, *args, **kwargs):
         nonlocal calls
         result = original_gptq(continuous, *args, **kwargs)
-        if calls:
+        if calls and weight_update == "regression_gptq":
             rounds.append((continuous.clone(), result.to(reference).clone()))
         calls += 1  # the first call is the retained comparison baseline
+        return result
+
+    def compensate(weight, cross, **kwargs):
+        result = original_compensate(weight, cross, **kwargs)
+        rounds.append((cross.clone(), result.to(reference).clone()))
         return result
 
     def fit(cross, factor, fitted_rank, **kwargs):
@@ -78,11 +91,13 @@ def test_rotated_rounds_match_token_regression_and_rank_constrained_oracles(
 
     monkeypatch.setattr(solver, "gptq", quantize)
     monkeypatch.setattr(solver, "low_rank_factors", fit)
-    options = {"weight_update": "regression_gptq", "iterations": 3, "damp_percent": 0.04,
+    monkeypatch.setattr(solver, "residual_compensation", compensate)
+    options = {"weight_update": weight_update, "iterations": 3, "damp_percent": 0.04,
                "loop_weights": weights.tolist(), "block_size": 6,
                "quantized_damping_target": q_target, "low_rank_damping_target": l_target}
     final_q, final_a, final_b, report = solve_linear(reference, stats, rank=rank,
-                                                  options=options, group_size=4, sharing=sharing)
+                                                  options=options, group_size=4, sharing=sharing,
+                                                  rotation={"enabled": True, "block_size": 8, "seed": 19} if dual else None)
     assert rounds and len(factor_calls) == loops * len(rounds)
     identity = torch.eye(width, dtype=torch.float64)
     groups = [torch.zeros_like(reference) for _ in range(loops)]
@@ -95,12 +110,18 @@ def test_rotated_rounds_match_token_regression_and_rank_constrained_oracles(
         for t in range(loops):
             scale = (weights[t] / z[t].shape[1]).sqrt()
             inputs.append(scale * z[t].T)
-            targets.append(scale * (y[t] - old_l[t] @ z[t]).T)
+            targets.append(scale * (y[t] - old_l[t] @ inputs_l[t]).T)
         ridge = report["q_damping"]**0.5
         inputs.append(ridge * identity)
         targets.append(ridge * q_reference.T)
         expected_q = torch.linalg.lstsq(torch.cat(inputs), torch.cat(targets)).solution.T
-        torch.testing.assert_close(continuous, expected_q, rtol=1e-10, atol=1e-12)
+        if weight_update == "regression_gptq":
+            torch.testing.assert_close(continuous, expected_q, rtol=1e-10, atol=1e-12)
+        else:
+            expected_cross = sum(weights[t] * (y[t] - old_l[t] @ inputs_l[t] - reference @ z[t]) @ z[t].T
+                                 / z[t].shape[1] for t in range(loops))
+            expected_cross += report["q_damping"] * (q_reference - reference)
+            torch.testing.assert_close(continuous, expected_cross, rtol=1e-10, atol=1e-12)
 
         for j in range(loops):
             inputs, targets = [], []
@@ -110,8 +131,8 @@ def test_rotated_rounds_match_token_regression_and_rank_constrained_oracles(
                          if sharing == "prefix" else torch.zeros_like(reference))
                 coefficient = weights[t] if sharing == "prefix" else 1.0
                 scale = (coefficient / z[t].shape[1])**0.5
-                inputs.append(scale * z[t].T)
-                targets.append(scale * (y[t] - (q + other) @ z[t]).T)
+                inputs.append(scale * inputs_l[t].T)
+                targets.append(scale * (y[t] - q @ z[t] - other @ inputs_l[t]).T)
                 ridge = (coefficient * report["low_rank_damping"][t])**0.5
                 anchor = old_l[t] if l_target == "update" else torch.zeros_like(reference)
                 inputs.append(ridge * identity)
@@ -123,13 +144,13 @@ def test_rotated_rounds_match_token_regression_and_rank_constrained_oracles(
             assert torch.linalg.matrix_rank(groups[j]) <= rank
         previous_q = q
         per_loop = [sum(groups[:t + 1]) if sharing == "prefix" else groups[t] for t in range(loops)]
-        data_loss = sum(weights[t] * ((q + per_loop[t]) @ z[t] - y[t]).square().sum()
+        data_loss = sum(weights[t] * (q @ z[t] + per_loop[t] @ inputs_l[t] - y[t]).square().sum()
                         / z[t].shape[1] for t in range(loops))
         assert report["iterations"][iteration]["loss"] == pytest.approx(float(data_loss), rel=1e-10, abs=1e-12)
 
     final_l = [sum((final_b[j] @ final_a[j] for j in range(t + 1)), torch.zeros_like(reference))
                if sharing == "prefix" else final_b[t] @ final_a[t] for t in range(loops)]
-    final_loss = sum(weights[t] * ((final_q + final_l[t]) @ z[t] - y[t]).square().sum()
+    final_loss = sum(weights[t] * (final_q @ z[t] + final_l[t] @ inputs_l[t] - y[t]).square().sum()
                      / z[t].shape[1] for t in range(loops))
     assert report["final_loss"] == pytest.approx(float(final_loss), rel=1e-10, abs=1e-12)
     assert report["final_loss"] <= report["baseline_loss"]

@@ -21,6 +21,9 @@ def _checkpoint_config(values):
     """
     values = deepcopy(values)
     method = values["method"]
+    # Missing input semantics belong to pre-dual-input checkpoints. Never
+    # reinterpret their saved A/B as acting on original FP activations.
+    method.setdefault("low_rank_input", "quantized")
     solver = method.get("solver", {})
     if "q_damping_target" in solver:
         solver.setdefault("quantized_damping_target", solver.pop("q_damping_target"))
@@ -56,6 +59,7 @@ def save_checkpoint(model, tokenizer, path, *, quantization_config=None, max_sha
                    or module.rotation_enabled != rotation_enabled
                    or module.rotation_block_size != rotation_block_size
                    or module.rotation_seed != rotation_seed
+                   or module.low_rank_input != config.method["low_rank_input"]
                    for module in modules)):
         raise ValueError("low_rank runtime and checkpoint configuration disagree")
     if any(parameter.requires_grad for module in modules for bank in (module.A, module.B) for parameter in bank):
@@ -64,6 +68,7 @@ def save_checkpoint(model, tokenizer, path, *, quantization_config=None, max_sha
     manifest = {
         "format": "low-rank-fake-quantized", "format_version": 1, "algorithm": "low_rank",
         "fake_quantization": True, "num_loops": config.num_loops,
+        "low_rank_input": config.method["low_rank_input"],
         "allocation": list(model._loopquant_allocation), "quantization_config": config.to_dict(),
         "rank_schedule": ([(loop + 1) * config.method["rank_step"] for loop in range(config.num_loops)]
                           if config.method["sharing"] == "prefix" else [config.method["rank_step"]] * config.num_loops),
@@ -88,6 +93,8 @@ def restore_structure(model, manifest):
     config = _checkpoint_config(manifest["quantization_config"])
     if config.algorithm != "low_rank" or config.num_loops != manifest["num_loops"]:
         raise ValueError("low_rank manifest and method configuration disagree")
+    if manifest.get("low_rank_input", "quantized") != config.method["low_rank_input"]:
+        raise ValueError("low_rank input metadata disagrees")
     if [activation_bits(config)] * config.num_loops != manifest["allocation"]:
         raise ValueError("low_rank activation allocation metadata disagrees")
     ranks = ([(loop + 1) * config.method["rank_step"] for loop in range(config.num_loops)]

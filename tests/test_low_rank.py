@@ -231,6 +231,7 @@ def test_linear_statistics_use_quantized_inputs_actual_teacher_and_fixed_clips(t
     current = stats["self_attn.q_proj"]
     reference = (rotate_weight(projection.weight, 32, 17) if rotation_enabled else projection.weight).double()
     for loop, (x, y) in enumerate(seen):
+        original_x = x.reshape(-1, 32).double()
         if rotation_enabled:
             x = block_hadamard_transform(x, 32, 17)
         z = quantize_activation(x, 4, clip=clips["self_attn.q_proj"][loop]).reshape(-1, 32).double()
@@ -238,6 +239,9 @@ def test_linear_statistics_use_quantized_inputs_actual_teacher_and_fixed_clips(t
         residual = y - z @ reference.T
         torch.testing.assert_close(current["hessian"][loop], z.T @ z / 6)
         torch.testing.assert_close(current["residual_cross"][loop], residual.T @ z / 6)
+        torch.testing.assert_close(current["low_rank_hessian"][loop], original_x.T @ original_x / 6)
+        torch.testing.assert_close(current["input_cross"][loop], original_x.T @ z / 6)
+        torch.testing.assert_close(current["low_rank_cross"][loop], residual.T @ original_x / 6)
         torch.testing.assert_close(current["residual_energy"][loop], residual.square().sum() / 6)
         assert current["hessian"].dtype == current["residual_cross"].dtype == torch.float64
     assert current["num_tokens"].tolist() == [6, 6]

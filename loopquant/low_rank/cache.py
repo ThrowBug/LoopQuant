@@ -281,13 +281,15 @@ def block_statistics(model, block_index, teacher, config, device):
 
     # Keep the teacher and clip keys intact. Old FP32 Y moments cannot recover
     # their lost accuracy by casting, so residual statistics get a fresh key.
-    description = {**description, "version": 3,
+    description = {**description, "version": 4,
+                   "low_rank_input": config.method["low_rank_input"],
                    "clips": {name: value.tolist() for name, value in clips.items()},
                    "target": "fp_linear_output_without_bias_minus_teacher_weight_rotated_z",
                    "accumulation_dtype": "float64"}
     path = teacher.directory / "linear_statistics" / fingerprint(description) / filename
     cached = _load_stat(path, description)
-    fields = ("hessian", "residual_cross", "residual_energy", "num_tokens")
+    fields = ("hessian", "residual_cross", "residual_energy", "num_tokens",
+              "low_rank_hessian", "input_cross", "low_rank_cross")
     if cached is not None:
         return {name: {field: cached[f"{name}.{field}"] for field in fields} for name in modules}, clips
 
@@ -295,6 +297,9 @@ def block_statistics(model, block_index, teacher, config, device):
     statistics = {name: {
         "hessian": torch.zeros(loops, module.in_features, module.in_features, device=device, dtype=torch.float64),
         "residual_cross": torch.zeros(loops, module.out_features, module.in_features, device=device, dtype=torch.float64),
+        "low_rank_hessian": torch.zeros(loops, module.in_features, module.in_features, device=device, dtype=torch.float64),
+        "input_cross": torch.zeros(loops, module.in_features, module.in_features, device=device, dtype=torch.float64),
+        "low_rank_cross": torch.zeros(loops, module.out_features, module.in_features, device=device, dtype=torch.float64),
         "residual_energy": torch.zeros(loops, device=device, dtype=torch.float64),
         "num_tokens": torch.zeros(loops, device=device, dtype=torch.int64),
     } for name, module in modules.items()}
@@ -311,9 +316,12 @@ def block_statistics(model, block_index, teacher, config, device):
         references[name] = reference.double()
 
     def collect_statistics(name, module, loop, value, target):
+        x = value.double()
         if rotation_enabled:
             value = block_hadamard_transform(value, rotation_block_size, rotation_seed)
         z = quantize_activation(value, bits, group, device_clips[name][loop]).double()
+        if config.method["low_rank_input"] == "quantized":
+            x = z
         y = target.double()
         if module.bias is not None:
             y = y - module.bias.double()
@@ -321,6 +329,9 @@ def block_statistics(model, block_index, teacher, config, device):
         current = statistics[name]
         current["hessian"][loop].addmm_(z.T, z)
         current["residual_cross"][loop].addmm_(residual.T, z)
+        current["low_rank_hessian"][loop].addmm_(x.T, x)
+        current["input_cross"][loop].addmm_(x.T, z)
+        current["low_rank_cross"][loop].addmm_(residual.T, x)
         current["residual_energy"][loop] += residual.square().sum()
         current["num_tokens"][loop] += len(z)
 
@@ -331,6 +342,8 @@ def block_statistics(model, block_index, teacher, config, device):
             raise ValueError("no calibration tokens collected for a loop")
         current["hessian"] /= counts[:, None, None]
         current["residual_cross"] /= counts[:, None, None]
+        for key in ("low_rank_hessian", "input_cross", "low_rank_cross"):
+            current[key] /= counts[:, None, None]
         current["residual_energy"] /= counts
     flat = {f"{name}.{field}": value.cpu() for name, current in statistics.items()
             for field, value in current.items()}

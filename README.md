@@ -633,60 +633,25 @@ format, shell launchers and HF/vLLM evaluation loaders are reused. Summaries
 report `low_rank_enabled: false`, zero low-rank parameter/byte counts and an
 all-zero rank schedule. Existing configurations retain rank_step=16 by default.
 
-The fitter minimizes the weighted sum of linear-output reconstruction errors
-`||(Q + L_t) Z_t - Y_t||² / N_t`. X_t and Y_t come from the FP teacher;
-Z_t is the fake-quantized/dequantized X_t using a fixed, offline-searched clip.
-Bias is subtracted from Y_t when present. This is a per-Linear objective, not
-decoder-block reconstruction or end-to-end training.
-
-1. Cache immutable FP teacher trajectories and original projection weights.
-2. Fit per-module/per-loop clipping by activation MSE. Activation quantization
-   remains dynamic symmetric group-wise: [-7,7] for A4 or [-127,127] for A8.
-   Both the base and low-rank branch consume the same Z_t; the correction is not
-   requantized.
-3. Replay each unmodified FP block with the original teacher collection batch
-   shapes. With original weight W0, form R0_t=Y_t-W0 Z_t directly and collect
-   H_t=Z_t Z_t'/N_t, K_t=R0_t Z_t'/N_t and ||R0_t||²/N_t entirely in FP64.
-   Activation rounding still uses the original activation dtype. Centering avoids
-   subtracting large Y-energy terms when scoring a nearly reconstructed layer.
-4. Start with all low-rank factors zero. With the factors fixed, update shared Q
-   using the selected weight solver. The default `regression_gptq` solves the
-   continuous regression, then quantizes with GPTQ using the Gram of Z. By default,
-   ridge penalizes the Q update relative to FP W0 in the first round and the
-   previous accepted Q in later rounds: W_new=W_ref+(D-W_ref H)(H+rho I)^-1,
-   where D includes the current low-rank subtraction. Residual moments compute
-   this without forming large D. With Q fixed, independent fits each loop by
-   weighted SVD; prefix makes one forward coordinate pass over its rank-k groups.
-   By default, the low-rank ridge penalizes the change of the complete product,
-   rho||L_t-L_t_previous||²; its first reference is zero.
-   The two damping targets can be selected independently below.
-5. Repeat complete Q/low-rank rounds, retaining the full Q/A/B combination with
-   the lowest original, unregularized reconstruction error. Also score a baseline
-   made by GPTQ of W0 plus ordinary weight-error SVD, using the same Z Gram and
-   clips as the alternating candidates. Independent repeats the rank-k factors
-   across loops; prefix splits a rank-Tk SVD into T consecutive rank-k groups.
-   This avoids incorrectly repeating and accumulating the same rank-k correction.
-   This is not the former FP-X-Gram baseline.
-   Stop if a round does not improve the preceding alternating round. A stronger
-   baseline does not prevent trying later alternating rounds. best_iteration=0
-   means the baseline won. Factors and the base are evaluated in their saved dtype;
-   this linear statistical objective does not simulate intermediate BF16 GEMM
-   rounding or account for upstream student-state drift.
-
-Block Adam training, STE and temporary student-state propagation have been
-removed. Ordinary weight-error SVD is only a comparison/fallback candidate;
-alternating rounds start from zero low-rank factors. The configuration is:
+The default fitter minimizes
+`sum_t lambda_t ||Q Z_t + L_t X_t - Y_t||² / N_t`.
+X_t and Y_t are the original FP teacher inputs and outputs; bias is subtracted
+from Y_t when present. Z_t is the optionally rotated, fake-quantized/dequantized
+activation using a fixed offline-searched clip. Only the Q branch consumes Z_t.
+The low-rank branch consumes original X_t, without rotation or quantization, in
+the model's original BF16/FP16 dtype. This is per-Linear reconstruction, not
+block reconstruction or end-to-end training.
 
 ```yaml
 method:
-  sharing: independent
-  rank_step: 16
-  rotation:
-    enabled: false
-    block_size: 32
-    seed: 42
+  sharing: independent              # independent or prefix
+  rank_step: 16                     # 0 disables low-rank fitting and inference
+  low_rank_input: full_precision    # quantized reproduces legacy branch inputs
+  rotation: {enabled: false, block_size: 32, seed: 42}
   solver:
-    weight_update: regression_gptq
+    initialization: quantized_first # only implemented initialization
+    weight_update: regression_gptq  # or residual_compensation
+    coordinate_sweeps: 1            # 0 disables fixed-grid Q refinement
     iterations: 3
     damp_percent: 0.001
     quantized_damping_target: update
@@ -700,133 +665,102 @@ method:
       max_calls_per_linear: 1
 ```
 
-Set `svd_diagnostics.enabled: true` to print the leading singular values from the
-weighted SVDs used by the actual low-rank updates. The comparison-only baseline
-SVD is not included. `top_multiplier: 1.2` prints `ceil(1.2 * rank)` values; it
-only controls logging and does not change the fitted rank. By default, at most
-one low-rank SVD call is printed for each target linear layer. Set
-`max_calls_per_linear: 0` to print every low-rank SVD call, but this can produce a
-large log because each loop and each outer iteration performs a separate weighted
-SVD.
+`initialization: quantized_first` starts all low-rank factors at zero, updates Q,
+and then fits the independent corrections or makes one forward prefix pass.
+The first Q update counts as iteration 1. `low_rank_first` is reserved for future
+work and currently raises a clear configuration error; it never silently falls
+back. `iterations` must be positive. `loop_weights` is null for equal weights or
+a list of T positive weights, normalized once by the solver.
 
-`iterations: 1` performs one Q update followed by one complete low-rank pass.
-Three rounds are a starting setting, not a validated Ouro optimum. `loop_weights`
-is null for equal weights or a positive list of length T; weights are normalized.
-`block_size` is the column processing width, not quantization group size.
-Any positive block size is supported, including sizes smaller than a group or
-not divisible by it. When a group crosses a processing-block boundary, its scale
-search includes the pending error feedback on the group's outside columns.
-Blocking therefore preserves the sequential quantization decisions up to
-floating-point rounding; it does not change which channels share a scale.
+Calibration and reuse:
 
-For fixed clips and teacher outputs, the default Q step uses
-H=sum_t lambda_t Z_t Z_t'/N_t and C=sum_t lambda_t E_t Z_t'/N_t,
-where E_t=Y_t-L_t Z_t. Its continuous optimum is
-W_tilde=(C+rho S)(H+rho I)^-1 with the configured damping reference S.
-Completing the square gives exactly the same regularized quadratic for GPTQ
-around W_tilde; the inverse factor is reused without adding damping again.
-The low-rank step uses G G'=H_t+rho_t I and
-M=(R_t Z_t'/N_t+rho_t S_t)G^-T, then L_t=[M]_k G^-1.
-The rank constraint applies to the complete new L_t in independent mode, and
-to each increment D_j in prefix mode; truncating the continuous L solution
-without whitening solves a different objective.
+1. Cache immutable FP teacher trajectories and original projection weights.
+2. Search per-projection/per-loop activation clips by activation MSE. Activations
+   use dynamic symmetric groups, with integer ranges [-7,7] for A4 and [-127,127]
+   for A8. No activation precision mixing is performed.
+3. Replay each original FP block with its collection batch shapes. Set
+   R0_t=Y_t-W0 Z_t, where W0 is the fixed reference in Q's input coordinates.
+   Collect ZZ'/N, XX'/N, XZ'/N, R0 Z'/N, R0 X'/N and ||R0||²/N in FP64.
+   These centered moments score the complete dual-input objective including its
+   cross term, without subtracting large teacher-output energies.
+4. Cache shared/per-loop/suffix Cholesky factors and fixed whitened cross moments
+   once per physical linear. Compute L XZ' as B(A XZ'), without materializing L.
+   Independent fitting uses M=KX G^-T-(Q-W0)(ZX' G^-T), plus the configured ridge
+   reference. Prefix also caches the fixed whitened suffix couplings. Only the
+   changing M needs another SVD; no token replay or Gram refactorization is needed
+   per alternating round.
+5. Round factors and Q to their saved dtype before scoring. Low-rank coordinates
+   that increase their regularized subproblem after rounding retain the old factors.
+   Select the complete Q/A/B candidate with the lowest original loss without ridge.
+   Stop after a full round fails to improve the preceding alternating round.
 
-With input rotation enabled, replace X_t by X_t R before activation clipping
-and quantization, and W0 by W0 R when constructing the reference residual.
-Y_t remains the original FP projection output (without bias): these are local
-input rotations, so the projection output coordinates do not change. Q and all
-low-rank groups are fitted in that rotated input basis. The unrotated teacher
-cache is reusable; rotated clip/statistics caches have distinct identities.
-Pure orthogonal rotation preserves W0's singular values. The weighted SVD
-diagnostics instead describe M, which also depends on activation quantization,
-the current Q, and damping. A smaller leading singular value alone does not
-establish that the compensation or the final model is worse.
+Raw teacher and clip caches remain reusable. Dual-input statistics use a new
+versioned key; older single-input moments cannot stand in for XX'/XZ'/R0X'.
+Sharing, rank, initialization, Q solver, refinement and damping do not alter the
+statistics key. `low_rank_input` does because it selects X or Z for the branch.
 
-Change only `method.sharing` to `prefix` to enable shared-prefix fitting; all
-other configuration fields and launcher arguments remain the same. Each outer
-iteration updates Q using the current complete L_t, freezes Q and the previous
-outer iteration's damping references, then updates groups j=1,...,T exactly once.
-New groups are immediately visible to later groups in that pass. No sweep-count
-setting is added; `iterations` continues to control the number of Q/low-rank rounds.
+The Q solvers share Gram S=sum_t lambda_t ZZ'/N and target
+C=sum_t lambda_t(Y_t-L_t X_t)Z_t'/N:
 
-For group j, all affected loops t>=j contribute. Let P_t be the sum of the other
-groups active in loop t. The coordinate minimizes the weighted reconstruction
-of Y_t-(Q+P_t)Z_t, plus rho_t||D_j+P_t-S_t||². Its Gram is
-sum_{t>=j} lambda_t(H_t+rho_t I); its cross moment is
-sum_{t>=j} lambda_t[K_t-(Q-W0+P_t)H_t+rho_t(S_t-P_t)]. Exact weighted rank-k SVD
-solves this subproblem. All other groups, including later groups from the prior
-iteration, are included in P_t. Factors are rounded to their saved dtype before
-acceptance; a coordinate that increases its regularized quadratic objective is
-kept at its old value. Final complete candidates still use the original loss
-without ridge. Reports include one `prefix_updates` entry per group per round.
-As with the independent path, this optimizes fixed teacher trajectories; it does
-not account for downstream student-state drift or guarantee a PPL improvement.
+- `regression_gptq`: solve Q_tilde=(C+rho Q_ref)(S+rho I)^-1, then apply GPTQ
+  with the same regularized inverse factor. No rotation or second damping is added.
+- `residual_compensation`: start the working weights at W0, round the first column
+  on its group grid, and compensate remaining free columns using the target
+  residual K=sum_t lambda_t[R0 Z'/N-L_t XZ'/N]+rho(Q_ref-W0).
+  Remaining columns reach their conditional continuous optimum, then use ordinary
+  GPTQ rounding feedback. This avoids forming the full unrestricted solution.
+  The update is inspired by GPTAQ; it is not its official input-neuron algorithm.
 
-`weight_update` selects one of two Q solvers; it does not change the low-rank
-SVD, activation clips, iteration selection or inference modules:
+Both solvers can run `coordinate_sweeps` fixed-grid refinement passes. Their actual
+per-row/group scales are returned by the quantizer; refinement never infers a
+new grid from the rounded weights. With P=C-QS (using regularized S/C), each column
+proposes RoundToGrid(q_j+P_j/S_jj), accepts non-increasing changes in the saved
+dtype, and updates P by a rank-one correction. Reports contain `q_unrefined_loss`,
+`q_loss`, `refined_weights` and final full-round `loss`. Refinement decreases its
+regularized Q subproblem; final selection still uses the unregularized full loss.
 
-- `regression_gptq` (default): continuous ridge regression followed by GPTQ.
-- `residual_compensation`: fixed-target residual compensation, adapted to arbitrary
-  output targets E_t=Y_t-L_t Z_t. Each round starts its working weights from FP W0;
-  the damping reference remains independently controlled below. It rounds the
-  first column on W0's group grid, then compensates all free columns for both
-  rounding and the full fixed-target residual. Once those columns reach their
-  conditional continuous optimum, later columns use ordinary GPTQ rounding
-  feedback. This avoids forming the unrestricted regression solution up front.
+Independent low-rank fitting uses the Gram XX'/N+rho_t I and cross moment
+(Y_t-Q Z_t)X_t'/N+rho_t L_ref. Cholesky G gives M=C G^-T, then
+L=[M]_k G^-1 via truncated SVD and triangular solves. The rank constraint is on
+the complete L, not just its increment. Prefix L_t=sum_{j<=t}D_j constrains each
+D_j to rank k and updates j=1,...,T once per outer iteration. Other groups P_t
+include new earlier groups and old later groups. The group cross is
+sum_{t>=j}lambda_t[(Y_t-QZ_t-P_t X_t)X_t'/N+rho_t(L_ref,t-P_t)],
+and its Gram is sum_{t>=j}lambda_t(XX'/N+rho_t I). Damping references remain
+fixed throughout the prefix pass. No additional low-rank sweep setting is added.
 
-Enable the new path by changing only `method.solver.weight_update` to `residual_compensation`.
-Both paths reuse the same FP teacher, activation-clip and FP64 residual-moment
-caches; no new statistics, dependencies or checkpoint format are required.
-The Q objective includes rho||Q-S||² in either path. For residual compensation,
-the residual at W0 is sum_t lambda_t(K_t-L_t H_t)+rho(S-W0);
-the actual Cholesky damping is used, with
-no second application of ridge. Residual projection uses FP64; column work,
-group-scale search and rounding feedback use FP32, as in the existing GPTQ.
+`quantized_damping_target` and `low_rank_damping_target` independently choose
+`weight` (zero reference) or `update` (previous accepted product), defaulting to
+`update`. The first Q reference is W0; the first L reference is zero. The same
+`damp_percent` controls relative ridge, rho=p*mean(diag(Gram)), separately for Q
+and each low-rank loop. Prefix regularizes complete cumulative L_t, not individual
+A/B or only D_j increments. FP64 Cholesky uses bounded, logged stability retries;
+reports retain actual Q, loop and suffix damping. GPTQ feedback uses FP32.
 
-The `residual_compensation` option uses a constrained update inspired by GPTAQ.
-It does not reproduce the official implementation's input-neuron residual decomposition.
-After fixing each rounded column, its free-weight update solves the conditional
-quadratic objective, up to floating-point rounding; this is not a global discrete
-optimum. Completing the square gives the same underlying objective as continuous
-regression plus GPTQ. Differences come from rounding order and group grids, and
-neither path is guaranteed to improve PPL. Reports identify this variant as
-`weight_update_implementation: residual_compensation`; `selected_candidate: baseline`
-and `best_iteration: 0` mean the fallback won, even if `residual_compensation` was requested.
-Older checkpoints using `weight_update: gptaq` are migrated to the new name on load.
+A comparison baseline is retained: GPTQ(W0) plus ordinary weight-residual SVD.
+For original-input compensation, its rotated residual is first inverse-transformed
+into the original input coordinates. Signed Hadamard inverse removes signs before
+Hadamard, unlike the forward transform. Independent repeats rank-k factors;
+prefix splits rank-Tk factors into T distinct rank-k groups. The baseline is
+only a candidate, not initialization. `best_iteration: 0` and
+`selected_candidate: baseline` indicate fallback selection. No Adam/STE is used.
+This fixed-teacher linear objective does not simulate intermediate BF16 GEMM
+rounding or upstream student-state drift, and does not guarantee better PPL.
 
-`quantized_damping_target` and `low_rank_damping_target` independently choose `weight`
-or `update`, both defaulting to `update`. For Q, these add rho||Q||² or
-rho||Q-Q_ref||² to the reconstruction objective; Q_ref is FP W0 initially and
-the previous accepted Q later.
-For each low-rank branch, they add rho_t||L_t||² or rho_t||L_t-L_t,prev||². The
-latter uses zero initially, so both modes coincide in the first round. Independent
-uses H+rho I and C+rho L_t,prev in its rank-k fit. Prefix keeps L_t,prev fixed for
-the entire coordinate pass, regularizes the complete cumulative L_t, and constrains
-each increment D_j to rank k. Its cumulative rank is at most tk. Neither mode
-regularizes A/B separately or constrains only the optimization-step difference.
-Both targets use the same `damp_percent`, with their respective Gram scale.
-Missing fields retain the defaults above, including when loading older configs.
-Targets are saved in checkpoint config and run reports; changing them reuses
-teacher, clipping and linear-statistics caches. Candidate selection still uses
-the original reconstruction error without ridge, including the fallback baseline.
+`svd_diagnostics.enabled: true` logs leading singular values of the current
+whitened M, excluding the comparison-only baseline. `top_multiplier: 1.2` prints
+ceil(1.2*k) values. `max_calls_per_linear: 1` limits logs; 0 prints every call.
+These options do not change rank. Small residual singular values do not by
+themselves demonstrate worse model quality.
 
-The relative ridge is `rho = damp_percent * mean(diag(H))`, computed separately
-for the shared Gram and each loop Gram (diagonal means have a 1e-8 numerical
-floor for zero inputs). The default relative damping is 0.001 for both updates.
-Gram accumulation, regression, Cholesky, SVD and objective scoring use FP64;
-GPTQ column feedback remains FP32 and reuses the inverse factor without adding
-damping twice. Cholesky checks finite inputs and retries with increasing ridge
-only up to max(requested_percent,0.01) times the diagonal mean, with at most eight
-attempts. Any increase is logged with projection/loop context; run reports store
-the actual shared and per-loop ridge values. Prefix combines the per-loop ridge
-values into suffix Grams, without adding a second ridge. A stability increase
-for suffix j is assigned to loop j and carried into earlier suffixes; later
-suffixes stay unchanged, so all coordinates retain one consistent objective.
-The resulting values are recorded as `low_rank_damping` and `prefix_group_damping`.
-Persistent failures report matrix
-shape, diagonal range and attempted damping. The reported loss excludes ridge,
-so a worsening complete round is rejected. Exact SVD and FP64 statistics can
-increase calibration time and memory; this does not change inference precision.
+`block_size` controls quantizer processing width, independently of group size.
+Any positive width is supported. Group searches include pending feedback across
+processing-block boundaries, preserving sequential decisions up to rounding.
+
+New checkpoints explicitly record `low_rank_input`. Old snapshots without it
+restore `quantized`, retaining their original shared rotated/quantized branch
+inputs. HF and vLLM call the same LowRankLinear forward implementation. Quantized
+weights remain unpacked fake-quantized floating tensors.
 
 Both sharing modes reuse the same teacher, clipping and linear-statistics caches,
 checkpoint format, and HF/vLLM inference modules. Old prefix checkpoints still
@@ -836,10 +770,9 @@ The former `hessian_mode: mean_activation` ablation is not part of this objectiv
 
 When `method.rotation.enabled: true`, the fitter first applies the same signed
 block-Hadamard transform to each target weight's input columns, then performs
-W4 quantization and low-rank fitting in that rotated coordinate system. During
-inference the activation is transformed online immediately before activation
-quantization; the saved base weight and A factors already use the rotated
-coordinates. `block_size` must be a power of two and divide every target input
+W4 quantization in that rotated coordinate system. During inference only the
+base branch activation is transformed online before quantization. Low-rank A
+factors consume original X and stay in its original coordinates. `block_size` must be a power of two and divide every target input
 width. The rotation metadata is stored in the low-rank checkpoint and restored
 without storing a dense matrix. The rotation-enabled example is
 `configs/ouro_1.4b_w4a4_low_rank_rotation.yaml`.

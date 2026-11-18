@@ -56,7 +56,8 @@ class LowRankPipeline:
                     q, a, b, report = solve_linear(
                         original, statistics.pop(name), rank=rank, options=options, sharing=sharing,
                         bits=config.quantization["weight_bits"], group_size=config.quantization["group_size"],
-                        logger=self.logger, label=label)
+                        logger=self.logger, label=label,
+                        rotation=rotation if config.method["low_rank_input"] == "full_precision" else None)
                     module.weight.copy_(q)
                     block_factors[name] = (a, b)
                     history.append({"block": index, "module": name, **report})
@@ -80,6 +81,8 @@ class LowRankPipeline:
             "algorithm": "low_rank", "fake_quantization": True,
             "activation_allocation": list(model._loopquant_allocation),
             "weight_update": options["weight_update"], "iterations": options["iterations"],
+            "initialization": options["initialization"], "coordinate_sweeps": options["coordinate_sweeps"],
+            "low_rank_input": config.method["low_rank_input"],
             "stage_order": ["teacher_cache", "linear_statistics",
                             (f"alternating_{options['weight_update']}_weighted_svd" if rank
                              else f"quantization_{options['weight_update']}")],

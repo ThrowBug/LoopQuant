@@ -86,3 +86,15 @@ def rotate_weight(weight: torch.Tensor, block_size: int, seed: int = 42) -> torc
         raise ValueError("linear weight must be a matrix")
     return block_hadamard_transform(weight, block_size, seed)
 
+
+def inverse_block_hadamard_transform(value: torch.Tensor, block_size: int, seed: int = 42) -> torch.Tensor:
+    """Apply R.T: remove signs BEFORE Hadamard (R is generally not symmetric)."""
+    width = value.shape[-1]
+    validate_block_hadamard(width, block_size)
+    dtype = torch.float64 if value.dtype == torch.float64 else torch.float32
+    device_type, device_index = _device_key(value.device)
+    signs = _signs_device(width, block_size, seed, device_type, device_index, dtype)
+    hadamard = _hadamard_device(block_size, device_type, device_index, dtype)
+    grouped = value.to(dtype).reshape(-1, width // block_size, block_size)
+    return ((grouped * signs) @ hadamard).reshape_as(value).to(value.dtype)
+

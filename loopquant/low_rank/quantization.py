@@ -30,7 +30,7 @@ def fit_clip(value, bits, group_size: GroupSize, ratios):
 
 @torch.no_grad()
 def gptq(weight, hessian, *, bits=4, group_size: GroupSize = 32, block_size=128, damp_percent=0.001,
-         inverse_factor=None):
+         inverse_factor=None, return_scales=False):
     """Quantize one shared matrix; caller defines the multi-loop Hessian."""
     if weight.ndim != 2:
         raise ValueError("gptq weight must be a matrix")
@@ -52,6 +52,7 @@ def gptq(weight, hessian, *, bits=4, group_size: GroupSize = 32, block_size=128,
     qmax = 2 ** (bits - 1) - 1
     resolved_group_size = effective_group_size(group_size, work.shape[1])
     scale = None
+    scales = []
     for start in range(0, work.shape[1], block_size):
         stop = min(start + block_size, work.shape[1])
         block = work[:, start:stop].clone()
@@ -72,6 +73,8 @@ def gptq(weight, hessian, *, bits=4, group_size: GroupSize = 32, block_size=128,
                 error = ((group[:, None, :] / candidates[:, :, None]).round().clamp(-qmax, qmax)
                          * candidates[:, :, None] - group[:, None, :]).square().mean(-1)
                 scale = candidates.gather(1, error.argmin(1, keepdim=True)).squeeze(1)
+                if return_scales:
+                    scales.append(scale.clone())
             current = block[:, local]
             quantized = (current / scale).round().clamp(-qmax, qmax) * scale
             result[:, column] = quantized
@@ -79,4 +82,5 @@ def gptq(weight, hessian, *, bits=4, group_size: GroupSize = 32, block_size=128,
             errors[:, local] = error
             block[:, local:] -= error[:, None] * inverse[column, column:stop][None, :]
         work[:, stop:] -= errors @ inverse[start:stop, stop:]
-    return result.to(weight.dtype)
+    result = result.to(weight.dtype)
+    return (result, torch.stack(scales, dim=1)) if return_scales else result
